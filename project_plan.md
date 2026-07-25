@@ -1,0 +1,230 @@
+# Hermes Family Assistant — Architecture Plan
+
+## Context
+
+`conductor` is currently an empty scaffold (just `README.md` + `pyproject.toml`, Python ≥3.12). The README is a project brief describing a household AI assistant ("HermesBot") reachable over Telegram, SMS, and phone calls, built on **Hermes Agent** (NousResearch/hermes-agent), a real open-source agent framework, plus **oMLX** (omlx.ai), a real local-inference server for Apple Silicon. I confirmed both projects exist and pulled their actual capabilities from their docs rather than guessing, since the README's tech names map to specific real products with specific constraints.
+
+Correcting my first pass: **Hermes Agent natively supports SMS via Twilio**, not just Telegram/Discord/Slack/etc. That removes the need for most of the custom "bridge" code I originally planned — the only genuinely custom software this project needs is the household data skill and a small reminder scheduler.
+
+This plan defines the system architecture, component responsibilities, tech stack, and the external accounts to create before implementation starts. No code is written in this phase.
+
+**Sources consulted:** [Hermes Agent docs](https://hermes-agent.nousresearch.com/docs/), [Hermes Agent GitHub](https://github.com/NousResearch/hermes-agent), [Hermes SMS docs](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/sms), [Hermes API Server docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server), [Hermes Configuration docs](https://hermes-agent.nousresearch.com/docs/user-guide/configuration), [oMLX](https://omlx.ai/), [Hermes Agent × ElevenLabs integration article](https://youmind.com/landing/x-viral-articles/call-hermes-agent-eleven-agents).
+
+---
+
+## Key facts that shape the design
+
+- **Hermes Agent** natively speaks Telegram, Discord, Slack, WhatsApp, Signal, Email, CLI, **and SMS via Twilio**. Each is its own gateway process (`hermes gateway ...`), started independently but sharing the same `~/.hermes` config/memory/skills. SMS runs Hermes's own webhook server (default port 8080, path `/webhooks/twilio`), strips markdown, splits messages over 1600 chars, and requires an explicit user allowlist.
+- The one channel Hermes does **not** natively speak is **real-time phone voice**. For that, Hermes exposes an **API Server mode** (`hermes gateway`, OpenAI-compatible, default port 8642, bearer-token auth) — the full agent (memory, skills, tools) as a plain `/v1/chat/completions` endpoint. ElevenLabs' Conversational AI platform calls this directly as its "custom LLM," so Hermes still does 100% of the reasoning/tool-calling; ElevenLabs only owns the audio layer (STT, TTS, turn-taking, barge-in).
+- Hermes takes cloud models as first-class providers (`model.provider: anthropic`, etc.) and a separate `auxiliary:` block for secondary/side-task models. There's no automatic complexity-based router — "local for routine, cloud for complex" means: **primary model = local via oMLX**, and a specific skill/tool path escalates to Anthropic when the agent (or a rule) decides a query needs it.
+- Hermes's own terminal/execution backend supports `local`, `docker`, `ssh`, `singularity`, `modal`, `daytona` — but running Hermes's `docker` backend *inside* our sandbox container would require mounting the host Docker socket in, which defeats the sandboxing goal. **One sandbox boundary, not two**: outer container = the jail, Hermes's internal terminal backend = `local` (scoped to that already-jailed filesystem).
+- **oMLX** is a signed/notarized macOS menubar app, not a container — it must run bare-metal to get Metal/GPU access, exposing `http://127.0.0.1:8000/v1` (OpenAI- and Anthropic-compatible) by default (configurable).
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph HOST["Mac Studio (M4 Max, 64GB) — bare macOS"]
+        OMLX["oMLX menubar app\nMLX inference engine\nOpenAI-compat API :8000\n(Hermes-4.3-36B-mlx-5Bit, local model)"]
+
+        subgraph DOCKER["Docker Desktop"]
+            subgraph SANDBOX["Sandbox container — no host filesystem mounts\nexcept one dedicated /data volume, no docker.sock"]
+                HERMES["Hermes Agent (NousResearch/hermes-agent)\n- Telegram gateway process\n- SMS gateway process (native Twilio webhook, :8080)\n- API Server process (:8642, OpenAI-compat)\n- terminal backend: local (jailed to container)\n- household skill: grocery/chores/agenda/reminders"]
+                SCHED["reminder scheduler (this repo)\npolls Calendar for due Hermes-tagged events\npushes via Telegram Bot API / Twilio REST API"]
+            end
+            VOL[("/data volume\nGoogle OAuth token, hermes memory + skills,\nscheduler bookkeeping (SQLite)")]
+        end
+
+        NGROK["ngrok agent\n(tunnels :8080 SMS webhook + :8642 API server)"]
+    end
+
+    subgraph CLOUD["Cloud services"]
+        TG["Telegram Bot API"]
+        TWILIO["Twilio\n(one number: SMS webhook -> Hermes,\nVoice -> imported into ElevenLabs)"]
+        ELEVEN["ElevenLabs Conversational AI\n(STT, TTS, turn-taking, barge-in)"]
+        ANTHROPIC["Anthropic API\n(complex-reasoning escalation)"]
+        GOOGLE["Google Tasks API (grocery/chores)\n+ Google Calendar API (agenda/reminders)"]
+    end
+
+    FAMILY(("Family members\nTelegram app / any phone"))
+
+    FAMILY <-->|messages| TG
+    FAMILY <-->|SMS| TWILIO
+    FAMILY <-->|phone call| TWILIO
+
+    TG <--> HERMES
+    HERMES --> OMLX
+    HERMES -.escalate complex query.-> ANTHROPIC
+    HERMES <-->|OAuth| GOOGLE
+
+    TWILIO -->|"A message comes in" webhook via ngrok| NGROK --> HERMES
+
+    TWILIO <-->|voice, imported number| ELEVEN
+    ELEVEN -->|custom LLM webhook via ngrok| NGROK --> HERMES
+
+    HERMES <--> VOL
+    SCHED <--> VOL
+    SCHED -->|poll upcoming events| GOOGLE
+    SCHED -.reminder fires.-> TG
+    SCHED -.reminder fires.-> TWILIO
+```
+
+### Component responsibilities
+
+| Component | Runs where | Responsibility |
+|---|---|---|
+| **oMLX** | Bare-metal macOS (menubar app) | Serves the local model over an OpenAI-compatible API using Metal/GPU acceleration. Handles routine, private household queries by default. |
+| **Hermes Agent — Telegram gateway** | Sandbox container | Native process for the Telegram bot: tool-use routing, skills, memory, markdown, group chat. |
+| **Hermes Agent — SMS gateway** | Sandbox container | Native process handling Twilio's "message comes in" webhook directly (own webhook server on :8080). No custom code needed here at all. |
+| **Hermes Agent — API Server** | Sandbox container, :8642 | Exposes the same agent as an OpenAI-compatible endpoint — the integration seam for ElevenLabs voice. |
+| **household skill** (custom, agentskills.io-standard) | Loaded by Hermes | Tools: `add_grocery_item`, `list_groceries`, `log_chore`, `get_agenda`, `add_calendar_event`, `set_reminder`, etc. Grocery list and chores map to **Google Tasks** lists; agenda/events/reminders map to **Google Calendar** — both via OAuth, so identical state regardless of which channel was used, and family members can also see/edit it directly in Google's own apps. |
+| **Google Tasks + Calendar API** | Cloud | The actual list/calendar backend behind the household skill. Official OAuth APIs, works with personal Gmail accounts (unlike the Google Keep API, which is Workspace-only). |
+| **reminder scheduler** (custom, this repo) | Sandbox container, companion process | The one piece of proactive-push logic nothing else provides: Google Calendar can notify the account owner, but it can't push into Telegram/SMS. The scheduler polls Calendar for upcoming Hermes-tagged events and pushes them out via Telegram Bot API or Twilio REST API, then marks them sent. |
+| **ElevenLabs Conversational AI** | Cloud | Owns the real-time voice layer end-to-end: STT, ultra-realistic TTS, turn-taking, barge-in. Its "custom LLM" endpoint points at Hermes's API Server (via ngrok) — Hermes does all the reasoning/tool-calling, ElevenLabs never touches household data directly. |
+| **ngrok** | Host (or a thin sidecar) | Public HTTPS tunnel(s) terminating at the container's SMS-webhook port (:8080) and API Server port (:8642), since Twilio and ElevenLabs both need a public URL to reach the sandboxed container. |
+| **Docker** | Host | The single sandbox boundary. No bind mount of `~/Documents`, iCloud Drive, Time Machine, or any host user directory — only the dedicated `/data` volume. No Docker socket mounted in. |
+
+### How each README scenario maps onto this
+
+- **Scenario 1 (Telegram group)** — Telegram → Hermes Telegram gateway (native) → household skill → Google Tasks → markdown reply.
+- **Scenario 2 (Voice, barge-in)** — Twilio Voice (number imported into ElevenLabs) → ElevenLabs owns audio + barge-in → custom-LLM callback → Hermes API Server (via ngrok) → household skill → response text → ElevenLabs TTS.
+- **Scenario 3 (SMS fallback)** — Twilio SMS webhook → ngrok → Hermes's native SMS gateway → household skill → Hermes sends the TwiML/REST reply itself. No custom bridge code.
+- **Scenario 4 (sandboxed script execution)** — Hermes's `terminal: local` backend runs *inside* the already-jailed container; no host directory is ever mounted in.
+
+---
+
+## Decisions (resolved)
+
+1. **Cloud LLM provider:** **Anthropic**. Native first-class provider in Hermes (`model.provider: anthropic` + `ANTHROPIC_API_KEY`) — wired in as the escalation target for complex reasoning, no custom `base_url` needed.
+
+2. **Local model recommendation:** ~~Hermes-4-14B, MLX 8-bit quantization~~ **superseded — see Phase 2 update below.** Original reasoning kept for the record:
+   - It's Nous Research's own agentic/tool-calling fine-tune — the same team that builds Hermes Agent — so its function-calling behavior is a strong match for Hermes's tool-use routing.
+   - 14B at 8-bit is ≈15GB resident, comfortably inside your 64GB unified memory budget alongside macOS, Docker, and a large context window/KV cache — with real headroom left over, unlike a 32B-class model at 8-bit (~35GB+) which would leave the system tight once Docker and context are added.
+   - Sits centrally in the README's stated 12B–32B target range rather than pushing the top of it.
+   - **Alternative** if you want a stronger generalist at the cost of more memory headroom: a ~27B–32B dense or MoE model (e.g. current Qwen3.x-class 4-bit MLX build, ~18–20GB) — worth A/B testing against Hermes-4-14B once both are running, but start with Hermes-4-14B.
+
+   **Update (Phase 2, 2026-07-25):** Hermes-4-14B-8bit's native context window is 40,960 tokens (`max_position_embeddings` in its `config.json` — this is the model's real ceiling, not an oMLX under-report). Hermes Agent hardcodes `MINIMUM_CONTEXT_LENGTH = 64_000` (`agent/model_metadata.py`) and refuses to start below it, so Hermes-4-14B is disqualified outright — this wasn't visible until Phase 2 tried an actual `hermes -z` call against it.
+   - **Local model, revised: Hermes-4.3-36B-mlx-5Bit** — newly downloaded, native context 524,288 (well clear of the floor), confirmed working end-to-end from inside the sandbox container in Phase 2.
+   - **Next comparison point:** **Qwen3.6-35B-A3B-MLX-6bit** — also newly downloaded, 262,144 native context, MoE (~3B active params/token, so inference cost tracks closer to a small model despite the 35B total). This was the plan's original "Alternative" line, now promoted to a real A/B candidate against Hermes-4.3-36B rather than against the disqualified Hermes-4-14B. Not yet tested — planned for after Hermes-4.3-36B is exercised through Phase 3+.
+
+3. **Voice bridging pattern:** Import the Twilio number directly into the ElevenLabs Agent (simplest — ElevenLabs owns the Voice webhook automatically).
+   - **On your SMS question:** yes, this should still work. Twilio phone numbers have two *independent* webhook slots — "A call comes in" (Voice) and "A message comes in" (Messaging/SMS). ElevenLabs' number-import feature only configures the **Voice** slot; it has no reason to touch Messaging. So the same number can have its Voice webhook owned by ElevenLabs and its Messaging webhook pointed at Hermes's native SMS gateway (via ngrok) at the same time.
+   - **One verification step to do at implementation time:** after importing the number into ElevenLabs, open the Twilio Console for that number and confirm the Messaging webhook is still set (or set it) to Hermes's SMS webhook URL — don't assume the import left it alone without checking.
+
+4. **Process layout:** One container. Hermes's Telegram gateway, SMS gateway, and API Server all run as separate processes inside a single sandbox container, sharing one `~/.hermes` config/memory/skills directory and the mounted `/data` volume. The reminder scheduler runs as a fourth lightweight companion process in the same container. Hermes never runs on the bare host — the Docker sandbox from Scenario 4 is non-negotiable, so it's the environment used from the very first working Hermes setup, not bolted on afterward.
+
+5. **Household data backend:** **Google Tasks + Google Calendar** (official OAuth APIs) instead of Google Keep or a local-only SQLite store.
+   - Google Keep's *official* API exists but is restricted to Google Workspace (Business/Enterprise/Education) accounts — it doesn't work with a personal Gmail account. The unofficial `gkeepapi` library works with personal accounts but is reverse-engineered, unsupported by Google, can break without notice, and requires storing Google account credentials inside the sandbox — in tension with the README's own privacy/security priority.
+   - Google Tasks (lists/checklists) and Google Calendar (events/agenda) are official, OAuth-based, fully supported on personal Gmail, and let family members see/edit the same data in apps they already use.
+   - Trade-off accepted: this means the household data itself lives in Google's cloud, not purely locally — a deliberate deviation from "keep private household data local" in exchange for reliability and using tools the family already has. If fully local storage turns out to matter more once this is running, the household skill can be swapped back to local SQLite later without touching any other component.
+
+---
+
+## Tech stack
+
+- **Host OS/hardware:** macOS on Mac Studio M4 Max, 64GB unified memory
+- **Local inference:** oMLX (omlx.ai) — bare-metal menubar app, OpenAI-compatible API on `:8000` (default, confirm on your install), running **Hermes-4.3-36B-mlx-5Bit** (superseded Hermes-4-14B-8bit in Phase 2 — see Decision 2 update; `Qwen3.6-35B-A3B-MLX-6bit` queued for A/B comparison)
+- **Agent core:** Hermes Agent (`NousResearch/hermes-agent`), Python/uv-based, MIT licensed — Telegram, SMS, and API Server gateway processes
+- **Cloud LLM (complex-reasoning escalation):** Anthropic, wired in as a native provider
+- **Containerization:** Docker Desktop for Mac, docker-compose for the sandbox container and the shared `/data` volume
+- **Custom code (this repo):** Python 3.12 — the household skill (agentskills.io standard) and the reminder scheduler process
+- **Household data store:** Google Tasks API (grocery list, chores) + Google Calendar API (agenda, events, reminders), via OAuth; a small SQLite file on the Docker-managed `/data` volume for the reminder scheduler's own bookkeeping and Hermes's memory/skills state
+- **Channels:**
+  - Telegram Bot API (via BotFather token) — native Hermes gateway
+  - Twilio Programmable SMS — native Hermes gateway
+  - Twilio Programmable Voice, number imported into ElevenLabs
+  - ElevenLabs Conversational AI (Agents Platform) — STT/TTS/turn-taking/barge-in, custom-LLM webhook into Hermes's API Server
+- **Network ingress:** ngrok tunnel(s) exposing the container's SMS-webhook port (:8080) and API Server port (:8642) publicly
+
+---
+
+## Accounts to create
+
+| # | Account | Why | Notes |
+|---|---|---|---|
+| 1 | **Telegram** (BotFather) | Create the household bot + token | Free, needs an existing Telegram account |
+| 2 | **Twilio** | One SMS+Voice-capable phone number, Account SID/Auth Token | Same number serves both SMS (via Hermes) and Voice (via ElevenLabs) |
+| 3 | **ElevenLabs** | Conversational AI (Agents Platform) API key | Confirm the plan tier includes phone/Twilio number import and enough conversational minutes |
+| 4 | **ngrok** | Auth token; a **reserved/static domain is recommended** (paid) | A free ephemeral URL changes on every restart, breaking the Twilio/ElevenLabs webhook config each time |
+| 5 | **Anthropic** | API key for the complex-reasoning escalation path | Standard Anthropic Console account + API key |
+| 6 | **Google Cloud project** | OAuth client for Google Tasks API + Google Calendar API | Enable both APIs in Google Cloud Console, create an OAuth 2.0 client, complete the consent flow once against the family Gmail account (or a dedicated household Google account) to get a refresh token |
+| 7 | **Hugging Face** (conditional) | Only if downloading a gated model | Hermes-4.3-36B-mlx-5Bit and Qwen3.6-35B-A3B-MLX-6bit were both downloaded directly through oMLX with no gating hit — not needed so far |
+
+---
+
+## Implementation Roadmap
+
+Each phase is a working, demoable milestone — nothing is built until the layer under it is verified. Hermes runs in Docker starting with Phase 2 and never on the bare host; channels and integrations are then added one at a time so a failure is always traceable to the thing that just changed.
+
+### Phase 1 — Local model foundation (no Hermes, no Docker yet) — ✅ COMPLETE (2026-07-25)
+- Install oMLX on the Mac Studio, pull `NousResearch/Hermes-4-14B` MLX 8-bit build, load it. Confirm the port it's actually listening on (default `:8000`, but verify against your install rather than assuming).
+- **Done when:** `curl http://127.0.0.1:8000/v1/chat/completions` returns a real completion from the host.
+- **Verified:**
+  - `lsof`/`ps` confirmed `omlx-server` listening on `127.0.0.1:8000` — the documented default held, no override needed.
+  - `GET /v1/models` shows `Hermes-4-14B-8bit` loaded and served alongside several other local models (Kokoro TTS, Whisper/Parakeet STT, a few smaller Llama/Qwen models) — oMLX is hosting a multi-model menu, not just the one model, worth remembering for later phases (e.g. STT/TTS options already sitting on the same box).
+  - `POST /v1/chat/completions` with model id `Hermes-4-14B-8bit` returned a real, coherent completion (2.9s, 32 completion tokens, `finish_reason: stop`).
+  - Note for Phase 2 config: the model id to put in Hermes's `model.name` (once we point Hermes's `custom` provider at oMLX) is `Hermes-4-14B-8bit`, not the bare `Hermes-4-14B` used in the plan doc — oMLX suffixes the quant.
+  - **Superseded in Phase 2:** `Hermes-4-14B-8bit` turned out to have a native 40,960-token context window, below Hermes Agent's hardcoded 64K minimum — it never actually got used past this smoke test. See Decision 2's Phase 2 update and Phase 2 below.
+
+### Phase 2 — Hermes Agent core, in Docker from the start — ✅ COMPLETE (2026-07-25)
+- Hermes never runs on the bare host (per Decision 4). Stand up the sandbox container per the architecture — `/data` volume only, no host directory mounts, no `docker.sock`, terminal backend `local` — and install/configure Hermes Agent inside it. Configure `model.provider: custom` / `base_url` pointing at oMLX via `host.docker.internal:8000`.
+- Hold a conversation via `hermes chat` (or equivalent CLI) inside the container, with no channels, no skills, no cloud fallback wired in yet.
+- **Done when:** the CLI agent answers questions from inside the container using *only* the local model, **and** `ls ~/Documents` (or similar) from inside the container confirms it cannot see the host filesystem — the Scenario 4 isolation guarantee, verified from day one rather than bolted on later.
+- **Built:**
+  - `Dockerfile` (repo root) — `debian:bookworm-slim`, non-root `hermes` user, official Hermes Agent install script (`hermes-agent.nousresearch.com/install.sh`) run non-interactively.
+  - `docker-compose.yml` (repo root) — single named volume `hermes_data` mounted at `/home/hermes/.hermes` (this **is** the architecture doc's `/data` volume: config, memory, skills, and later the OAuth token + scheduler SQLite). No bind mounts of any host directory. No `docker.sock`. `host.docker.internal` reachable natively on Docker Desktop for Mac.
+  - `docker/hermes-config.yaml` — `model.provider: custom`, `base_url: http://host.docker.internal:8000/v1`, `terminal.backend: local`.
+- **Verified:**
+  - `hermes doctor` inside the container confirmed the terminal backend itself, unprompted: *"Running inside a container — using local terminal backend (docker-in-docker is not configured by default)"* — matching Decision 4/the plan's "one sandbox boundary, not two" reasoning exactly.
+  - First attempt (`Hermes-4-14B-8bit`) failed hard at `hermes -z`: `agent failed: Model Hermes-4-14B-8bit has a context window of 40,960 tokens, which is below the minimum 64,000 required by Hermes Agent`. Confirmed via the model's own `config.json` (`max_position_embeddings: 40960`) that this is the model's real ceiling, not a server under-report — so Hermes-4-14B was disqualified rather than patched around with a fake `model.context_length` override. See Decision 2 update.
+  - User downloaded two replacement candidates directly into oMLX: `Hermes-4.3-36B-mlx-5Bit` (524,288 context) and `Qwen3.6-35B-A3B-MLX-6bit` (262,144 context). Switched config to `Hermes-4.3-36B-mlx-5Bit`.
+  - `hermes -z "In one short sentence, what model are you and who is serving you?"` from inside the container returned: *"I am Hermes-4.3-36B-mlx-5Bit, and I am serving myself as I'm currently running on my own local provider."* — real completion, local model only, no channels/skills/cloud configured.
+  - Isolation checks, all passed: `ls ~/Documents` → no such file or directory; `ls /var/run/docker.sock` → no such file or directory; `mount` shows only the container's own overlay filesystem, nothing from the host.
+- **Carried into Phase 3+:** switched `docker/hermes-config.yaml` to `Qwen3.6-35B-A3B-MLX-6bit` and re-ran the same basic smoke test — `hermes -z "In one short sentence, what model are you and who is serving you?"` correctly returned *"I'm Hermes Agent, running on a Qwen3.6-35B-A3B-MLX-6bit model served via a custom provider."* Confirms the config swap path works cleanly (edit `docker/hermes-config.yaml` → `docker cp` into the running container's `~/.hermes/config.yaml`, no rebuild needed). The real A/B — tool-calling behavior under the household skill — still awaits Phase 6 (moved post-voice, see reordering note below); this was just a basic-chat sanity check. **Qwen3.6-35B-A3B-MLX-6bit is now the active configured model** pending that comparison.
+
+**Reordering note (2026-07-25):** Household skill and reminder scheduler were originally Phases 3 and 5 — moved to Phases 6 and 7, after all three channels (Telegram, SMS, Voice) are proven with plain local-model conversation. Rationale: get the harder infrastructure integrations (especially ElevenLabs voice/barge-in) validated early against a known-good local model, before adding the custom household business logic on top. Consequence: Telegram/SMS/Voice's done-when criteria below now check channel plumbing only (message/call in, coherent reply out) — the household-data checks that used to live in each of those phases (grocery item via Telegram, grocery/calendar parity via SMS, "answer sourced from the household skill" via voice) are consolidated into a single cross-channel integration pass at the end of Phase 6, once household data actually exists to check. The reminder scheduler moved with the household skill since it has nothing to poll (no Google Calendar) until that phase runs.
+
+### Phase 3 — Telegram integration (Scenario 1, channel plumbing only) — ✅ COMPLETE (2026-07-25)
+- Create the bot via BotFather, configure Hermes's native Telegram gateway process, start it alongside the CLI-tested config.
+- **Done when:** a real Telegram message gets a coherent reply generated by the local model — no household data involved yet, this is purely proving the gateway process works.
+- **Built:**
+  - Bot created via BotFather (`@FamilyConductorBot`); token + numeric allowed-user ID collected.
+  - Repo-root `.env` (gitignored) holds `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_USERS` as the source of truth; `docker/sync-env.py` merges it into the container's `~/.hermes/.env` in place (replacing commented template lines, preserving everything else) via `docker cp` + exec — no secret ever appears on a host command line or in shell history.
+  - `docker-compose.yml`: added `sysctls: net.ipv6.conf.all.disable_ipv6=1`.
+- **Verified / debugged:**
+  - First connection attempts appeared to hang forever at "Connecting to Telegram (attempt 1/8)…" with no further console output. Root-caused to **two separate issues**, not one:
+    1. **Real bug:** the container's default Docker Desktop bridge network answers AAAA (IPv6) queries for external hosts but has no real IPv6 egress (`curl -6` failed instantly, `curl -4` worked). Fixed by disabling IPv6 at the kernel level inside the container (see Built, above) — matters for Twilio/ElevenLabs in later phases too, not just Telegram.
+    2. **Test-harness artifact, not a real hang:** even after the IPv6 fix, `docker exec ... | timeout 90 hermes gateway run 2>&1` still only ever showed that one console line. The actual `~/.hermes/logs/gateway.log` proved the gateway connects successfully in ~11s every time ("Connected to Telegram (polling mode)") — the CLI's console rendering simply wasn't flushing further output through a non-TTY piped `docker exec`, before my `timeout` wrapper killed the process. Lesson: **trust `~/.hermes/logs/gateway.log`, not piped console output, when diagnosing this gateway.**
+  - Started for real via `docker exec -d hermes-sandbox hermes gateway run`; `hermes gateway status` confirmed `✓ Gateway is running`.
+  - **User sent a live Telegram message and confirmed a coherent reply** — Phase 3's done-when, met with a real phone, not just `hermes -z`.
+  - Reviewed the actual authorization source (`gateway/authz_mixin.py`) rather than trusting docs alone: `TELEGRAM_ALLOWED_USERS` is enforced at message intake, *before* the agent/LLM/tools are invoked — an unauthorized sender is logged and dropped, never reaching the local model or household data. Noted for later: group chats need `TELEGRAM_GROUP_ALLOWED_CHATS` (a separate variable) once the bot joins the family group; the framework's separate "DM pairing" self-enroll path exists but is unused and unaudited — flagged for the Phase 9 hardening pass, not a blocker now.
+
+### Phase 4 — SMS integration (Scenario 3, channel plumbing only)
+- Twilio account + number, ngrok tunnel to the container's `:8080`, point the number's Messaging webhook at Hermes's native SMS gateway.
+- **Done when:** a text to the household number gets a plain-text reply from the local model.
+
+### Phase 5 — Voice integration (Scenario 2, channel plumbing only)
+- Enable Hermes's API Server process (`:8642`), stand up an ElevenLabs Conversational AI agent, import the Twilio number's **Voice** webhook into ElevenLabs, point ElevenLabs' custom-LLM URL at Hermes's API Server via ngrok.
+- Verify in the Twilio Console that the **Messaging** webhook from Phase 4 is untouched (per Decision 3).
+- **Done when:** a live phone call gets a spoken answer from the local model, and interrupting mid-response (barge-in) correctly cuts off TTS and registers the new turn — no household grounding yet, this proves the audio/turn-taking pipeline only.
+
+### Phase 6 — Household skill v1: Google Tasks + Calendar, verified across all three channels
+- Create the Google Cloud project, enable the Tasks and Calendar APIs, create an OAuth client, and complete the one-time consent flow to get a refresh token for the household skill to use.
+- Build the custom household skill: `add_grocery_item`, `list_groceries`, `log_chore` (→ Google Tasks), `get_agenda`, `add_calendar_event`, `set_reminder` (→ Google Calendar), storing the OAuth token on the `/data` volume.
+- Exercise it via `hermes chat` inside the container first, then re-verify through each already-working channel from Phases 3–5.
+- **Done when:** items/events created through Hermes show up in the actual Google Tasks/Calendar apps and persist across separate sessions; **and**, as the integration pass this reordering deferred: "add milk to the grocery list" over Telegram shows up in Google Tasks, the same grocery/calendar state is visible whether written via Telegram or SMS, and a live phone call gets a spoken answer sourced from the household skill.
+
+### Phase 7 — Reminder scheduler
+- Build the companion scheduler process: polls Google Calendar for upcoming Hermes-tagged events, pushes a proactive message via Telegram Bot API when one comes due, and marks it sent (Google's own notifications can't reach Telegram/SMS, so this polling+push logic is unavoidable custom code).
+- **Done when:** "remind me at 3pm to pick up Sam" results in an unprompted Telegram message at 3pm.
+
+### Phase 8 — Cloud escalation (Anthropic)
+- Add Anthropic as a provider in Hermes's config; decide and implement the escalation trigger (e.g. an explicit "complex reasoning" tool the agent invokes, or a manual per-conversation override) — see Decision 2's note that this isn't automatic. Added last since every channel needs to already be working to meaningfully test escalation from each of them.
+- **Done when:** a deliberately complex query visibly routes to Anthropic while routine queries stay on the local model (check logs/latency to confirm which model answered) — tested from at least Telegram and voice.
+
+### Phase 9 — Hardening & operational polish
+- Lock down ngrok (reserved domain, auth), tighten Hermes's SMS/Telegram user allowlists, confirm secrets (Twilio, ElevenLabs, Anthropic, Google OAuth token) live only in `.env`/Docker secrets and are never committed, set container restart policies, and re-run the Scenario 4 isolation check as a final regression test.
+- Add basic operational logging and confirm the Google Tasks/Calendar data (and the local scheduler-bookkeeping SQLite file) survive a container restart.
+- **Done when:** all four README scenarios pass in one continuous session without manual intervention, and the sandbox isolation check from Phase 2 still passes.

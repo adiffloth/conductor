@@ -1,0 +1,13 @@
+# Phase 2: local-model-only config. No channels, no skills, no cloud fallback yet.
+# oMLX runs bare-metal on the host; host.docker.internal is Docker Desktop for Mac's
+# built-in DNS name for reaching it from inside this container.
+model:
+  provider: custom
+  model: Qwen3.6-35B-A3B-MLX-6bit
+  base_url: http://host.docker.internal:8000/v1
+
+# 'local' here means local *to the container* — this is the already-jailed
+# filesystem (no host bind mounts, no docker.sock), so Hermes's own terminal
+# backend does not need to add a second sandbox layer on top.
+terminal:
+  backend: local

@@ -1,0 +1,30 @@
+services:
+  hermes:
+    build: .
+    container_name: hermes-sandbox
+    volumes:
+      # The one and only volume: this is the architecture plan's "/data" —
+      # Hermes's ~/.hermes (config/memory/skills), and later the Google OAuth
+      # token + reminder-scheduler SQLite. No bind mounts of any host
+      # directory (Documents, iCloud Drive, etc.), no docker.sock.
+      - hermes_data:/home/hermes/.hermes
+    environment:
+      # oMLX doesn't require auth, but Hermes's OpenAI-compatible client
+      # expects a non-empty key.
+      - OPENAI_API_KEY=local-omlx-no-key-required
+    extra_hosts:
+      # host.docker.internal is native on Docker Desktop for Mac; this entry
+      # is a no-op there but keeps the compose file portable to Linux hosts.
+      - "host.docker.internal:host-gateway"
+    sysctls:
+      # Docker Desktop's default bridge network answers AAAA queries for
+      # external hosts but has no real IPv6 egress — clients that prefer
+      # IPv6 (Hermes's Telegram adapter included) hang instead of falling
+      # back to IPv4 quickly. Disabling IPv6 in the container forces IPv4
+      # for all outbound connections (Telegram, and later Twilio/ElevenLabs).
+      - net.ipv6.conf.all.disable_ipv6=1
+    stdin_open: true
+    tty: true
+
+volumes:
+  hermes_data:
