@@ -3,7 +3,7 @@
 ## Project Description
 The goal of this project is to build a secure, private, and highly accessible AI family assistant using **Hermes Agent**. The assistant will act as a centralized hub for a single household, allowing multiple family members to coordinate daily logistics, manage shared schedules, and automate home routines. 
 
-To ensure maximum availability and natural interaction, the assistant runs concurrently across three communication channels: **Telegram** (for rich messaging and group chats), **SMS** (for simple, app-free access), and **Direct Voice Calls** (for hands-free, real-time spoken conversations). 
+To ensure maximum availability and natural interaction, the assistant runs concurrently across multiple communication channels: **Telegram** (for rich messaging and group chats), **SMS** (for simple, app-free access, pending carrier registration — see iMessage below), **iMessage** (for native, app-free access on Apple devices, serving as the interim low-friction text channel while SMS onboarding completes), and **Direct Voice Calls** (for hands-free, real-time spoken conversations). 
 
 Security, low latency, and performance are critical priorities. The assistant utilizes a hybrid intelligence model, keeping private household data and routine executions local, while leveraging cloud models for complex reasoning. To protect the host system, the runtime core must be strictly sandboxed from personal user files while maintaining access to high-performance local hardware acceleration.
 
@@ -19,6 +19,7 @@ Security, low latency, and performance are critical priorities. The assistant ut
 
 *   **Scenario 3: Low-Tech Fallback Access (SMS)**  
     A family member without a smartphone data plan sends a standard text message to the dedicated household number: *"What time is the dentist appointment tomorrow?"* Hermes intercepts the SMS, queries the local calendar database, and texts back an instant, concise reply.
+    *(Implementation note: Twilio SMS requires A2P 10DLC carrier registration, in progress. In the meantime, iMessage via Photon serves as the interim text channel for family members on Apple devices — see project_plan.md for the tradeoffs.)*
 
 *   **Scenario 4: Secure Local Execution (Sandboxed Sandbox)**  
     The system administrator asks Hermes to generate a script that aggregates weekly household chore completions. Because the file operations happen inside a restricted environment, the agent executes the task safely without any ability to read or mutate the host system's primary user directories or cloud backup folders.
@@ -35,6 +36,7 @@ The AI coding agent should utilize the following technologies to implement the s
 *   **Security & Isolation:** **Docker** wrapper. The Hermes gateway and execution environment must run inside a containerized sandbox, utilizing internal network rules to communicate back out to the host's oMLX server.
 *   **Communication Channels:** 
     *   **Telegram Bot API** (via BotFather framework tokens).
-    *   **Twilio Programmable SMS API** (for inbound and outbound text routing).
+    *   **Twilio Programmable SMS API** (for inbound and outbound text routing) — pending A2P 10DLC carrier registration.
+    *   **Photon (Spectrum SDK)** (managed iMessage integration, free tier) — interim/parallel text channel for Apple-device family members while SMS registration is pending.
     *   **Twilio Programmable Voice & ElevenLabs (ElevenAgents)** (orchestrated webhooks for full-duplex, real-time conversational streaming, speech-to-text, ultra-realistic voice synthesis, and audio barge-in support).
-*   **Network Ingress:** **Ngrok** to create a secure public tunnel endpoint that routes incoming Twilio webhooks (both SMS and Voice/ElevenLabs media streams) safely directly to the sandboxed container port.
+*   **Network Ingress:** **Ngrok** to create a secure public tunnel endpoint that routes incoming Twilio webhooks (both SMS and Voice/ElevenLabs media streams) safely directly to the sandboxed container port. (Photon does not require ngrok — it uses a persistent outbound connection, no public webhook.)

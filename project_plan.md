@@ -31,27 +31,30 @@ flowchart TB
 
         subgraph DOCKER["Docker Desktop"]
             subgraph SANDBOX["Sandbox container — no host filesystem mounts\nexcept one dedicated /data volume, no docker.sock"]
-                HERMES["Hermes Agent (NousResearch/hermes-agent)\n- Telegram gateway process\n- SMS gateway process (native Twilio webhook, :8080)\n- API Server process (:8642, OpenAI-compat)\n- terminal backend: local (jailed to container)\n- household skill: grocery/chores/agenda/reminders"]
+                HERMES["Hermes Agent (NousResearch/hermes-agent)\n- Telegram gateway process\n- SMS gateway process (native Twilio webhook, :8080) — pending A2P\n- Photon gateway process (iMessage, persistent gRPC, no webhook)\n- API Server process (:8642, OpenAI-compat)\n- terminal backend: local (jailed to container)\n- household skill: grocery/chores/agenda/reminders"]
+                PHOTONSC["Photon Node sidecar\n(spectrum-ts gRPC client,\nsupervised by the Photon adapter,\nloopback only, :8789)"]
                 SCHED["reminder scheduler (this repo)\npolls Calendar for due Hermes-tagged events\npushes via Telegram Bot API / Twilio REST API"]
             end
             VOL[("/data volume\nGoogle OAuth token, hermes memory + skills,\nscheduler bookkeeping (SQLite)")]
         end
 
-        NGROK["ngrok agent\n(tunnels :8080 SMS webhook + :8642 API server)"]
+        NGROK["ngrok agent\n(tunnels :8080 SMS webhook + :8642 API server —\nPhoton needs no tunnel, no public URL)"]
     end
 
     subgraph CLOUD["Cloud services"]
         TG["Telegram Bot API"]
-        TWILIO["Twilio\n(one number: SMS webhook -> Hermes,\nVoice -> imported into ElevenLabs)"]
+        TWILIO["Twilio\n(one number: SMS webhook -> Hermes, pending A2P,\nVoice -> imported into ElevenLabs)"]
+        PHOTONCLOUD["Photon / Spectrum cloud\n(app.photon.codes — managed iMessage\nline pool, free tier: per-user assigned lines)"]
         ELEVEN["ElevenLabs Conversational AI\n(STT, TTS, turn-taking, barge-in)"]
         ANTHROPIC["Anthropic API\n(complex-reasoning escalation)"]
         GOOGLE["Google Tasks API (grocery/chores)\n+ Google Calendar API (agenda/reminders)"]
     end
 
-    FAMILY(("Family members\nTelegram app / any phone"))
+    FAMILY(("Family members\nTelegram app / any phone / iPhone"))
 
     FAMILY <-->|messages| TG
-    FAMILY <-->|SMS| TWILIO
+    FAMILY <-->|SMS, pending A2P| TWILIO
+    FAMILY <-->|iMessage, per-user line| PHOTONCLOUD
     FAMILY <-->|phone call| TWILIO
 
     TG <--> HERMES
@@ -60,6 +63,9 @@ flowchart TB
     HERMES <-->|OAuth| GOOGLE
 
     TWILIO -->|"A message comes in" webhook via ngrok| NGROK --> HERMES
+
+    PHOTONSC <-->|persistent gRPC stream| PHOTONCLOUD
+    HERMES <-->|loopback HTTP, send/typing/inbound| PHOTONSC
 
     TWILIO <-->|voice, imported number| ELEVEN
     ELEVEN -->|custom LLM webhook via ngrok| NGROK --> HERMES
@@ -77,20 +83,22 @@ flowchart TB
 |---|---|---|
 | **oMLX** | Bare-metal macOS (menubar app) | Serves the local model over an OpenAI-compatible API using Metal/GPU acceleration. Handles routine, private household queries by default. |
 | **Hermes Agent — Telegram gateway** | Sandbox container | Native process for the Telegram bot: tool-use routing, skills, memory, markdown, group chat. |
-| **Hermes Agent — SMS gateway** | Sandbox container | Native process handling Twilio's "message comes in" webhook directly (own webhook server on :8080). No custom code needed here at all. |
+| **Hermes Agent — SMS gateway** | Sandbox container | Native process handling Twilio's "message comes in" webhook directly (own webhook server on :8080). No custom code needed here at all. **Pending A2P 10DLC registration (in progress offline) — not yet live.** |
+| **Hermes Agent — Photon gateway (iMessage)** | Sandbox container | Native process; persistent gRPC connection to Photon's Spectrum cloud via the Node sidecar — no webhook, no public URL, no ngrok. Free tier: each family member is registered individually (`hermes photon setup --phone <E.164>`) and gets their own assigned iMessage line from Photon's shared pool, not one shared household number. |
+| **Photon Node sidecar** | Sandbox container, loopback :8789 | Small supervised Node process running the `spectrum-ts` SDK (TypeScript-only) — bridges the Python gateway to Photon's gRPC stream. Started/restarted/killed by the Python adapter; never invoked directly. |
 | **Hermes Agent — API Server** | Sandbox container, :8642 | Exposes the same agent as an OpenAI-compatible endpoint — the integration seam for ElevenLabs voice. |
 | **household skill** (custom, agentskills.io-standard) | Loaded by Hermes | Tools: `add_grocery_item`, `list_groceries`, `log_chore`, `get_agenda`, `add_calendar_event`, `set_reminder`, etc. Grocery list and chores map to **Google Tasks** lists; agenda/events/reminders map to **Google Calendar** — both via OAuth, so identical state regardless of which channel was used, and family members can also see/edit it directly in Google's own apps. |
 | **Google Tasks + Calendar API** | Cloud | The actual list/calendar backend behind the household skill. Official OAuth APIs, works with personal Gmail accounts (unlike the Google Keep API, which is Workspace-only). |
 | **reminder scheduler** (custom, this repo) | Sandbox container, companion process | The one piece of proactive-push logic nothing else provides: Google Calendar can notify the account owner, but it can't push into Telegram/SMS. The scheduler polls Calendar for upcoming Hermes-tagged events and pushes them out via Telegram Bot API or Twilio REST API, then marks them sent. |
 | **ElevenLabs Conversational AI** | Cloud | Owns the real-time voice layer end-to-end: STT, ultra-realistic TTS, turn-taking, barge-in. Its "custom LLM" endpoint points at Hermes's API Server (via ngrok) — Hermes does all the reasoning/tool-calling, ElevenLabs never touches household data directly. |
-| **ngrok** | Host (or a thin sidecar) | Public HTTPS tunnel(s) terminating at the container's SMS-webhook port (:8080) and API Server port (:8642), since Twilio and ElevenLabs both need a public URL to reach the sandboxed container. |
+| **ngrok** | Host (or a thin sidecar) | Public HTTPS tunnel(s) terminating at the container's SMS-webhook port (:8080) and API Server port (:8642), since Twilio and ElevenLabs both need a public URL to reach the sandboxed container. **Not used by Photon** — its gRPC connection is outbound-only from the sidecar, no inbound public endpoint required. |
 | **Docker** | Host | The single sandbox boundary. No bind mount of `~/Documents`, iCloud Drive, Time Machine, or any host user directory — only the dedicated `/data` volume. No Docker socket mounted in. |
 
 ### How each README scenario maps onto this
 
 - **Scenario 1 (Telegram group)** — Telegram → Hermes Telegram gateway (native) → household skill → Google Tasks → markdown reply.
 - **Scenario 2 (Voice, barge-in)** — Twilio Voice (number imported into ElevenLabs) → ElevenLabs owns audio + barge-in → custom-LLM callback → Hermes API Server (via ngrok) → household skill → response text → ElevenLabs TTS.
-- **Scenario 3 (SMS fallback)** — Twilio SMS webhook → ngrok → Hermes's native SMS gateway → household skill → Hermes sends the TwiML/REST reply itself. No custom bridge code.
+- **Scenario 3 (SMS fallback)** — Twilio SMS webhook → ngrok → Hermes's native SMS gateway → household skill → Hermes sends the TwiML/REST reply itself. No custom bridge code. **Pending A2P 10DLC registration** (started offline, days-long carrier process) — see Decision 6. In the meantime, **iMessage via Photon** serves as the interim text channel for Apple-device family members: no ngrok/webhook needed (persistent gRPC), but it doesn't fully satisfy this scenario's "no smartphone data plan" framing (iMessage requires an iPhone) — true SMS remains the target once A2P clears.
 - **Scenario 4 (sandboxed script execution)** — Hermes's `terminal: local` backend runs *inside* the already-jailed container; no host directory is ever mounted in.
 
 ---
@@ -120,6 +128,13 @@ flowchart TB
    - Google Tasks (lists/checklists) and Google Calendar (events/agenda) are official, OAuth-based, fully supported on personal Gmail, and let family members see/edit the same data in apps they already use.
    - Trade-off accepted: this means the household data itself lives in Google's cloud, not purely locally — a deliberate deviation from "keep private household data local" in exchange for reliability and using tools the family already has. If fully local storage turns out to matter more once this is running, the household skill can be swapped back to local SQLite later without touching any other component.
 
+6. **Phase 4 messaging channel: Photon (iMessage, free tier) now, Twilio SMS deferred.** (2026-07-25)
+   - The Twilio number acquired for SMS turned out to need **A2P 10DLC carrier registration** before it can reliably send outbound messages (inbound is generally unaffected, but replies risk silent carrier filtering without it). Registration was started, but is a days-long offline process — not something to block Phase 4 on.
+   - Explored two Hermes-native alternatives for the interim: **BlueBubbles** (self-hosted, runs on your own Mac, fully local data flow) and **Photon** (managed cloud service, `photon.codes`). BlueBubbles was ruled out because it bridges through whatever Apple ID is already signed into Messages.app on the host Mac — the user actively uses iMessage on that machine and didn't want to give Hermes that identity or sign out of their own account.
+   - **Photon free tier chosen**, with a real limitation surfaced and accepted: Photon's free/Pro tiers use a **shared iMessage line pool** — each family member is individually registered (`hermes photon setup --phone <E.164>`) and assigned their *own* number from the pool, not one shared household number. A single dedicated number that the whole household texts requires Photon's **Business tier ($250/line/month)** — judged disproportionate for this project and explicitly rejected. Consequence: onboarding a new family member is manual (the operator runs the CLI, then hands that person their assigned number out of band) rather than self-serve like Telegram's public bot username.
+   - Photon needs no ngrok/public webhook at all (persistent outbound gRPC via a supervised Node sidecar) — architecturally simpler than both SMS and Voice in that respect.
+   - Trade-off accepted, same category as Decision 5: Photon is a third-party cloud service mediating household messages, not fully local — a deliberate deviation from "keep private data local," accepted for the same reasons (reliability, avoiding reverse-engineered alternatives, avoiding real cost). **Twilio SMS remains the target for README Scenario 3's "no smartphone data plan" case** once A2P registration clears — Photon does not replace that use case, since iMessage requires an iPhone.
+
 ---
 
 ## Tech stack
@@ -133,10 +148,11 @@ flowchart TB
 - **Household data store:** Google Tasks API (grocery list, chores) + Google Calendar API (agenda, events, reminders), via OAuth; a small SQLite file on the Docker-managed `/data` volume for the reminder scheduler's own bookkeeping and Hermes's memory/skills state
 - **Channels:**
   - Telegram Bot API (via BotFather token) — native Hermes gateway
-  - Twilio Programmable SMS — native Hermes gateway
+  - Twilio Programmable SMS — native Hermes gateway — **pending A2P 10DLC registration** (Decision 6)
+  - Photon (Spectrum SDK, free tier) — native Hermes gateway, managed iMessage — **active as of Phase 4**, interim channel while SMS registration is pending (Decision 6)
   - Twilio Programmable Voice, number imported into ElevenLabs
   - ElevenLabs Conversational AI (Agents Platform) — STT/TTS/turn-taking/barge-in, custom-LLM webhook into Hermes's API Server
-- **Network ingress:** ngrok tunnel(s) exposing the container's SMS-webhook port (:8080) and API Server port (:8642) publicly
+- **Network ingress:** ngrok tunnel(s) exposing the container's SMS-webhook port (:8080) and API Server port (:8642) publicly. Photon needs no tunnel — persistent outbound gRPC only.
 
 ---
 
@@ -145,12 +161,13 @@ flowchart TB
 | # | Account | Why | Notes |
 |---|---|---|---|
 | 1 | **Telegram** (BotFather) | Create the household bot + token | Free, needs an existing Telegram account |
-| 2 | **Twilio** | One SMS+Voice-capable phone number, Account SID/Auth Token | Same number serves both SMS (via Hermes) and Voice (via ElevenLabs) |
-| 3 | **ElevenLabs** | Conversational AI (Agents Platform) API key | Confirm the plan tier includes phone/Twilio number import and enough conversational minutes |
-| 4 | **ngrok** | Auth token; a **reserved/static domain is recommended** (paid) | A free ephemeral URL changes on every restart, breaking the Twilio/ElevenLabs webhook config each time |
-| 5 | **Anthropic** | API key for the complex-reasoning escalation path | Standard Anthropic Console account + API key |
-| 6 | **Google Cloud project** | OAuth client for Google Tasks API + Google Calendar API | Enable both APIs in Google Cloud Console, create an OAuth 2.0 client, complete the consent flow once against the family Gmail account (or a dedicated household Google account) to get a refresh token |
-| 7 | **Hugging Face** (conditional) | Only if downloading a gated model | Hermes-4.3-36B-mlx-5Bit and Qwen3.6-35B-A3B-MLX-6bit were both downloaded directly through oMLX with no gating hit — not needed so far |
+| 2 | **Twilio** | One SMS+Voice-capable phone number, Account SID/Auth Token | Same number serves both SMS (via Hermes) and Voice (via ElevenLabs). **SMS side blocked on A2P 10DLC registration** (in progress offline, days-long) — Voice use is unaffected. |
+| 3 | **Photon** (`photon.codes`) | Managed iMessage integration, free tier | `hermes photon setup --phone <E.164>` per family member — device-login OAuth via browser, no payment needed on free tier. Re-run per person to onboard each family member individually (see Decision 6 for the per-user-number limitation). |
+| 4 | **ElevenLabs** | Conversational AI (Agents Platform) API key | Confirm the plan tier includes phone/Twilio number import and enough conversational minutes |
+| 5 | **ngrok** | Auth token; a **reserved/static domain is recommended** (paid) | A free ephemeral URL changes on every restart, breaking the Twilio/ElevenLabs webhook config each time. Not needed for Photon. |
+| 6 | **Anthropic** | API key for the complex-reasoning escalation path | Standard Anthropic Console account + API key |
+| 7 | **Google Cloud project** | OAuth client for Google Tasks API + Google Calendar API | Enable both APIs in Google Cloud Console, create an OAuth 2.0 client, complete the consent flow once against the family Gmail account (or a dedicated household Google account) to get a refresh token |
+| 8 | **Hugging Face** (conditional) | Only if downloading a gated model | Hermes-4.3-36B-mlx-5Bit and Qwen3.6-35B-A3B-MLX-6bit were both downloaded directly through oMLX with no gating hit — not needed so far |
 
 ---
 
@@ -186,6 +203,8 @@ Each phase is a working, demoable milestone — nothing is built until the layer
 
 **Reordering note (2026-07-25):** Household skill and reminder scheduler were originally Phases 3 and 5 — moved to Phases 6 and 7, after all three channels (Telegram, SMS, Voice) are proven with plain local-model conversation. Rationale: get the harder infrastructure integrations (especially ElevenLabs voice/barge-in) validated early against a known-good local model, before adding the custom household business logic on top. Consequence: Telegram/SMS/Voice's done-when criteria below now check channel plumbing only (message/call in, coherent reply out) — the household-data checks that used to live in each of those phases (grocery item via Telegram, grocery/calendar parity via SMS, "answer sourced from the household skill" via voice) are consolidated into a single cross-channel integration pass at the end of Phase 6, once household data actually exists to check. The reminder scheduler moved with the household skill since it has nothing to poll (no Google Calendar) until that phase runs.
 
+**Channel substitution note (2026-07-25, Decision 6):** Phase 4's channel changed from SMS to iMessage via Photon — SMS itself split off into deferred Phase 4b, blocked on A2P 10DLC registration (external, days-long, in progress offline). Phase 6's cross-channel integration pass (below) checks Telegram + Photon + Voice for now; the SMS leg of that check gets folded in once Phase 4b unblocks, rather than holding up Phase 6.
+
 ### Phase 3 — Telegram integration (Scenario 1, channel plumbing only) — ✅ COMPLETE (2026-07-25)
 - Create the bot via BotFather, configure Hermes's native Telegram gateway process, start it alongside the CLI-tested config.
 - **Done when:** a real Telegram message gets a coherent reply generated by the local model — no household data involved yet, this is purely proving the gateway process works.
@@ -201,20 +220,26 @@ Each phase is a working, demoable milestone — nothing is built until the layer
   - **User sent a live Telegram message and confirmed a coherent reply** — Phase 3's done-when, met with a real phone, not just `hermes -z`.
   - Reviewed the actual authorization source (`gateway/authz_mixin.py`) rather than trusting docs alone: `TELEGRAM_ALLOWED_USERS` is enforced at message intake, *before* the agent/LLM/tools are invoked — an unauthorized sender is logged and dropped, never reaching the local model or household data. Noted for later: group chats need `TELEGRAM_GROUP_ALLOWED_CHATS` (a separate variable) once the bot joins the family group; the framework's separate "DM pairing" self-enroll path exists but is unused and unaudited — flagged for the Phase 9 hardening pass, not a blocker now.
 
-### Phase 4 — SMS integration (Scenario 3, channel plumbing only)
-- Twilio account + number, ngrok tunnel to the container's `:8080`, point the number's Messaging webhook at Hermes's native SMS gateway.
-- **Done when:** a text to the household number gets a plain-text reply from the local model.
+### Phase 4 — iMessage integration via Photon (Scenario 3 interim, channel plumbing only)
+- **Replaces SMS as the Phase 4 channel** — see Decision 6. Twilio's number needs A2P 10DLC carrier registration before it can reliably send outbound SMS; registration was started offline (days-long process) and SMS itself moves to Phase 4b below, to be picked up whenever that clears.
+- Run `hermes photon setup --phone <E.164>` (device-login OAuth via browser, provisions the Photon project, registers the operator's number, installs the Node sidecar). No ngrok/webhook needed — persistent gRPC.
+- **Done when:** a real iMessage to the operator's assigned Photon line gets a coherent reply generated by the local model — no household data involved yet, same plumbing-only bar as Telegram/SMS.
+
+### Phase 4b — SMS integration (Scenario 3, deferred pending A2P 10DLC)
+- **Not yet started — blocked on an external, days-long carrier registration process, not on any implementation work.** Deliberately not renumbered into the main sequence so later phases don't need to shift again once this becomes unblocked.
+- Once A2P 10DLC registration clears: ngrok tunnel to the container's `:8080`, point the Twilio number's Messaging webhook at Hermes's native SMS gateway.
+- **Done when:** a text to the household number gets a plain-text reply from the local model, confirming the same functionality originally scoped for this slot.
 
 ### Phase 5 — Voice integration (Scenario 2, channel plumbing only)
 - Enable Hermes's API Server process (`:8642`), stand up an ElevenLabs Conversational AI agent, import the Twilio number's **Voice** webhook into ElevenLabs, point ElevenLabs' custom-LLM URL at Hermes's API Server via ngrok.
-- Verify in the Twilio Console that the **Messaging** webhook from Phase 4 is untouched (per Decision 3).
+- If Phase 4b (SMS) has landed by this point, verify in the Twilio Console that its **Messaging** webhook is untouched (per Decision 3). If not, there's no Messaging webhook yet to check — Phase 4's channel is Photon, which doesn't use the Twilio Console at all.
 - **Done when:** a live phone call gets a spoken answer from the local model, and interrupting mid-response (barge-in) correctly cuts off TTS and registers the new turn — no household grounding yet, this proves the audio/turn-taking pipeline only.
 
-### Phase 6 — Household skill v1: Google Tasks + Calendar, verified across all three channels
+### Phase 6 — Household skill v1: Google Tasks + Calendar, verified across all working channels
 - Create the Google Cloud project, enable the Tasks and Calendar APIs, create an OAuth client, and complete the one-time consent flow to get a refresh token for the household skill to use.
 - Build the custom household skill: `add_grocery_item`, `list_groceries`, `log_chore` (→ Google Tasks), `get_agenda`, `add_calendar_event`, `set_reminder` (→ Google Calendar), storing the OAuth token on the `/data` volume.
 - Exercise it via `hermes chat` inside the container first, then re-verify through each already-working channel from Phases 3–5.
-- **Done when:** items/events created through Hermes show up in the actual Google Tasks/Calendar apps and persist across separate sessions; **and**, as the integration pass this reordering deferred: "add milk to the grocery list" over Telegram shows up in Google Tasks, the same grocery/calendar state is visible whether written via Telegram or SMS, and a live phone call gets a spoken answer sourced from the household skill.
+- **Done when:** items/events created through Hermes show up in the actual Google Tasks/Calendar apps and persist across separate sessions; **and**, as the integration pass this reordering deferred: "add milk to the grocery list" over Telegram shows up in Google Tasks, the same grocery/calendar state is visible whether written via Telegram or iMessage (Photon), and a live phone call gets a spoken answer sourced from the household skill. If Phase 4b (SMS) has landed by now, fold it into this same parity check; if not, revisit once it does.
 
 ### Phase 7 — Reminder scheduler
 - Build the companion scheduler process: polls Google Calendar for upcoming Hermes-tagged events, pushes a proactive message via Telegram Bot API when one comes due, and marks it sent (Google's own notifications can't reach Telegram/SMS, so this polling+push logic is unavoidable custom code).
