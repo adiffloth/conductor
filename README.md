@@ -1,9 +1,9 @@
 # Project Brief: Secure Hybrid Family AI Assistant
 
 ## Project Description
-The goal of this project is to build a secure, private, and highly accessible AI family assistant named **Hermes Agent**. The assistant will act as a centralized hub for a single household, allowing multiple family members to coordinate daily logistics, manage shared schedules, and automate home routines. 
+The goal of this project is to build a secure, private, and highly accessible AI family assistant using **Hermes Agent**. The assistant will act as a centralized hub for a single household, allowing multiple family members to coordinate daily logistics, manage shared schedules, and automate home routines. 
 
-To ensure maximum availability and natural interaction, the assistant runs concurrently across three communication channels: **Telegram** (for rich messaging and group chats), **SMS** (for universal fallback access), and **Direct Voice Calls** (for hands-free, real-time spoken conversations). 
+To ensure maximum availability and natural interaction, the assistant runs concurrently across three communication channels: **Telegram** (for rich messaging and group chats), **SMS** (for simple, app-free access), and **Direct Voice Calls** (for hands-free, real-time spoken conversations). 
 
 Security, low latency, and performance are critical priorities. The assistant utilizes a hybrid intelligence model, keeping private household data and routine executions local, while leveraging cloud models for complex reasoning. To protect the host system, the runtime core must be strictly sandboxed from personal user files while maintaining access to high-performance local hardware acceleration.
 
@@ -37,4 +37,4 @@ The AI coding agent should utilize the following technologies to implement the s
     *   **Telegram Bot API** (via BotFather framework tokens).
     *   **Twilio Programmable SMS API** (for inbound and outbound text routing).
     *   **Twilio Programmable Voice & ElevenLabs (ElevenAgents)** (orchestrated webhooks for full-duplex, real-time conversational streaming, speech-to-text, ultra-realistic voice synthesis, and audio barge-in support).
-*   **Network Ingress:** **Ngrok** or **Cloudflared** to create a secure public tunnel endpoint that routes incoming Twilio webhooks (both SMS and Voice/ElevenLabs media streams) safely directly to the sandboxed container port.
+*   **Network Ingress:** **Ngrok** to create a secure public tunnel endpoint that routes incoming Twilio webhooks (both SMS and Voice/ElevenLabs media streams) safely directly to the sandboxed container port.
