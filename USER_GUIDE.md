@@ -43,6 +43,7 @@ oMLX itself) run on the host outside Docker.
 | `household/ab_test/run_ab_test.py` | Replays the script against the live API Server, records per-turn latency + transcript to `household/ab_test/results/<label>.json` |
 | `household/ab_test/judge_eval.py` | Grades two transcripts turn-by-turn using an LLM judge (`gpt-5.4`), reports a win tally + avg latency |
 | `household/ab_test/results/` | Gitignored — local test artifacts only, not committed |
+| `family_members.json` | Multi-user scheduling registry (name → email). Not committed — PII, same treatment as `.env`. See "Add a family member" below |
 
 **Inside the container, NOT in this repo** (lives in the `hermes_data` Docker
 volume, persists across container recreation but not across a volume wipe):
@@ -53,6 +54,7 @@ volume, persists across container recreation but not across a volume wipe):
 | `~/.hermes/.env` | Secrets, synced from this repo's `.env` (see "Common tasks" below) |
 | `~/.hermes/google_token.json` | Google OAuth token (Calendar + Tasks scopes) |
 | `~/.hermes/google_client_secret.json` | Google OAuth client credentials |
+| `~/.hermes/family_members.json` | Synced copy of the repo-root `family_members.json` (see "Add a family member" below) |
 | `~/.hermes/scripts/household_reminders.py` | The cron entrypoint wrapper (copy of `household/cron_entrypoint.py`) |
 | `~/.hermes/logs/gateway.log` | Platform connect/disconnect, message-level activity — **the first place to look when something doesn't work** |
 | `~/.hermes/logs/agent.log` | Per-turn reasoning/tool-call trace — noisier, useful for "why did it do that" |
@@ -200,6 +202,55 @@ fixed, which looks exactly like the bug is still there when it isn't.
 docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11 \
     /home/hermes/household/seed_demo_data.py
 ```
+
+**Add a family member (multi-user scheduling):**
+
+Two separate steps — one the family member does themselves in their own
+Google account, one you do in this repo. Order doesn't matter, but nothing
+works until both are done.
+
+*Step 1 — the family member shares free/busy access with the household
+account* (their own action, in their own Google Calendar — nothing to
+install, no OAuth flow):
+1. They go to [Google Calendar](https://calendar.google.com) → Settings
+   (gear icon) → click their calendar under "Settings for my calendars" →
+   **Share with specific people**.
+2. Add the household's Google account email (the same account used for the
+   Calendar/Tasks OAuth setup — see "Google, specifically" above) with
+   permission **"See only free/busy (hide details)"**. That's deliberately
+   the minimum — Hermes doesn't need to see their event titles/locations to
+   suggest a meeting time, only when they're busy. (Higher permission
+   levels work too but aren't needed for anything this project does.)
+3. This step is **only** needed so `suggest_meeting_time` can check their
+   availability. Adding them as an event attendee (below) works regardless
+   of this — that's a normal Calendar invite, unrelated to sharing.
+
+*Step 2 — register them in `family_members.json`* (your action, this repo):
+```bash
+# Edit family_members.json at the repo root, e.g.:
+# {"family_members": [{"name": "Sam", "email": "sam@gmail.com"}]}
+# "name" is what people will say in conversation ("schedule this for Sam")
+# — match matters exactly (case-insensitive, no fuzzy matching, so "Sam"
+# and "Samantha" are different entries if that's how the household talks).
+
+docker cp family_members.json hermes-sandbox:/home/hermes/.hermes/family_members.json
+docker exec -u root hermes-sandbox chown hermes:hermes /home/hermes/.hermes/family_members.json
+docker exec hermes-sandbox hermes gateway stop
+docker exec -d hermes-sandbox hermes gateway run
+```
+The explicit `chown` matters — `docker cp` preserves the *host* file's
+ownership, which doesn't match the `hermes` user inside the container, and
+the gateway/tools run as `hermes`. Skipping it means the file silently
+can't be read (or, worse, an earlier copy silently can't be overwritten).
+
+**Verify it worked** — ask (from any channel): *"who are the registered
+family members?"* and *"can you find a 30-minute slot tomorrow that works
+for me and \<name\>?"* The second one should either return real suggestions
+that account for their calendar, or clearly say their availability
+couldn't be checked (not shared yet) — never silently ignore them and
+suggest a slot as if they don't exist. Full mechanism, including why this
+is registry-based rather than something you can just tell the bot in
+conversation, is in `project_plan.md`'s "Multi-user support" section.
 
 **Run another A/B test (local vs cloud model, latency + LLM-judged quality):**
 

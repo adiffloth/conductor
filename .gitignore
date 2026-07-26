@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .DS_Store
 household/ab_test/results/
+family_members.json

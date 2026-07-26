@@ -17,6 +17,14 @@ Google has since shipped its own official, remote Calendar MCP server
 (calendarmcp.googleapis.com, GA'd May 2026) with a broader tool set than
 the calendar half of this file. Not adopted yet — see the Phase 9 research
 item in project_plan.md before adding more surface area here.
+
+Multi-user scheduling (see project_plan.md "Multi-user support" section):
+reads a small, operator-managed registry (~/.hermes/family_members.json,
+not committed — see USER_GUIDE.md "Add a family member") to resolve names
+mentioned in conversation to email addresses, so events can be scheduled
+against everyone's real free/busy and delivered as a native Calendar
+invite to their own calendar. Deliberately not a tool a conversation can
+write to — see that section for why.
 """
 import json
 import os
@@ -40,6 +48,7 @@ except ImportError:
 
 HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
+FAMILY_MEMBERS_PATH = HERMES_HOME / "family_members.json"
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/tasks",
@@ -117,6 +126,32 @@ def _event_summary(e: dict) -> dict:
     }
 
 
+def _load_family_members() -> list[dict]:
+    if not FAMILY_MEMBERS_PATH.exists():
+        return []
+    return json.loads(FAMILY_MEMBERS_PATH.read_text()).get("family_members", [])
+
+
+def _resolve_emails(names: list[str]) -> tuple[list[str], list[str]]:
+    """Resolve family-member names to their registered emails.
+
+    Matching is case-insensitive on the full name only (no fuzzy/partial
+    matching) — deliberately strict, since a silent mismatch here means
+    either the wrong person gets a calendar invite or a real person's
+    availability gets skipped without anyone noticing. Returns
+    (resolved_emails, names_that_did_not_match).
+    """
+    by_name = {m["name"].strip().lower(): m["email"] for m in _load_family_members()}
+    emails, unresolved = [], []
+    for name in names:
+        email = by_name.get(name.strip().lower())
+        if email:
+            emails.append(email)
+        else:
+            unresolved.append(name)
+    return emails, unresolved
+
+
 def _default_window(start: str, end: str) -> tuple[str, str]:
     now = datetime.now(timezone.utc)
     time_min = _with_timezone(start) if start else now.isoformat()
@@ -156,7 +191,21 @@ def get_agenda(start: str = "", end: str = "") -> str:
 
 
 @mcp.tool()
-def add_calendar_event(summary: str, start: str, end: str, location: str = "") -> str:
+def list_family_members() -> str:
+    """List the household's registered family members by name. Use this
+    before scheduling something on someone's behalf (add_calendar_event's
+    attendees, or suggest_meeting_time's people) if you're at all unsure
+    how their name is spelled/registered — an unrecognized name is reported
+    back rather than silently dropped, but checking first avoids a
+    round-trip.
+    """
+    return json.dumps([{"name": m["name"]} for m in _load_family_members()], ensure_ascii=False)
+
+
+@mcp.tool()
+def add_calendar_event(
+    summary: str, start: str, end: str, location: str = "", attendees: list[str] | None = None
+) -> str:
     """Create a calendar event.
 
     Args:
@@ -164,21 +213,36 @@ def add_calendar_event(summary: str, start: str, end: str, location: str = "") -
         start: ISO 8601 start datetime with timezone (e.g. 2026-07-27T15:00:00Z).
         end: ISO 8601 end datetime with timezone.
         location: Optional location text.
+        attendees: Names of registered family members who need to attend,
+            besides whoever is asking. Each gets a real Google Calendar
+            invite sent to their registered email — this is how the event
+            ends up on their own personal calendar too, not just the
+            household's. A name that isn't registered is reported back in
+            the result rather than silently skipped — tell the user.
     """
     event = {"summary": summary, "start": {"dateTime": start}, "end": {"dateTime": end}}
     if location:
         event["location"] = location
 
+    emails, unresolved = _resolve_emails(attendees or [])
+    if emails:
+        event["attendees"] = [{"email": e} for e in emails]
+
     service = _calendar_service()
-    result = service.events().insert(calendarId="primary", body=event).execute()
-    return json.dumps(
-        {
-            "status": "created",
-            "id": result["id"],
-            "summary": result.get("summary", ""),
-            "htmlLink": result.get("htmlLink", ""),
-        }
+    result = (
+        service.events()
+        .insert(calendarId="primary", body=event, sendUpdates="all" if emails else "none")
+        .execute()
     )
+    response = {
+        "status": "created",
+        "id": result["id"],
+        "summary": result.get("summary", ""),
+        "htmlLink": result.get("htmlLink", ""),
+    }
+    if unresolved:
+        response["unresolved_attendee_names"] = unresolved
+    return json.dumps(response, ensure_ascii=False)
 
 
 REMINDER_CHANNELS = {"telegram", "photon"}
@@ -319,13 +383,22 @@ def search_calendar_events(query: str, start: str = "", end: str = "") -> str:
 
 
 @mcp.tool()
-def suggest_meeting_time(duration_minutes: int, start: str = "", end: str = "") -> str:
+def suggest_meeting_time(
+    duration_minutes: int, people: list[str] | None = None, start: str = "", end: str = ""
+) -> str:
     """Suggest open time slots of a given length within a time window, based
     on existing calendar busy periods (free/busy check, not working-hours
     aware — a slot at 2am counts as "free" if nothing's scheduled then).
 
     Args:
         duration_minutes: How long the slot needs to be, in minutes.
+        people: Names of registered family members who also need to be free
+            for this, besides the household calendar. Use
+            list_family_members first if you're unsure a name is
+            registered. A name that isn't registered, or whose calendar
+            hasn't been shared with the household yet, is reported back
+            separately rather than silently treated as free — tell the
+            user rather than assuming the suggested slots account for them.
         start: ISO 8601 start of the search window. Defaults to now.
         end: ISO 8601 end of the search window. Defaults to 7 days after start.
     """
@@ -334,19 +407,31 @@ def suggest_meeting_time(duration_minutes: int, start: str = "", end: str = "") 
     window_end = datetime.fromisoformat(time_max.replace("Z", "+00:00"))
     duration = timedelta(minutes=duration_minutes)
 
+    emails, unresolved = _resolve_emails(people or [])
+    calendar_ids = ["primary"] + emails
+
     service = _calendar_service()
     result = (
         service.freebusy()
-        .query(body={"timeMin": time_min, "timeMax": time_max, "items": [{"id": "primary"}]})
+        .query(body={"timeMin": time_min, "timeMax": time_max, "items": [{"id": cid} for cid in calendar_ids]})
         .execute()
     )
-    busy = result["calendars"]["primary"]["busy"]
+    calendars = result.get("calendars", {})
+
+    # A calendar the household account can't see (not shared, or shared
+    # without even free/busy visibility) comes back with an "errors" entry
+    # instead of a "busy" list — checked explicitly so an unshared calendar
+    # is reported, not silently treated as wide open.
+    unavailable = [cid for cid, data in calendars.items() if data.get("errors")]
+
     busy_intervals = sorted(
         (
             datetime.fromisoformat(b["start"].replace("Z", "+00:00")),
             datetime.fromisoformat(b["end"].replace("Z", "+00:00")),
         )
-        for b in busy
+        for cid, data in calendars.items()
+        if not data.get("errors")
+        for b in data.get("busy", [])
     )
 
     suggestions = []
@@ -359,10 +444,14 @@ def suggest_meeting_time(duration_minutes: int, start: str = "", end: str = "") 
         suggestions.append((cursor, window_end))
 
     return json.dumps(
-        [
-            {"start": s.isoformat(), "end": (s + duration).isoformat()}
-            for s, _ in suggestions[:5]
-        ],
+        {
+            "suggestions": [
+                {"start": s.isoformat(), "end": (s + duration).isoformat()}
+                for s, _ in suggestions[:5]
+            ],
+            "unresolved_names": unresolved,
+            "could_not_check_availability_for": unavailable,
+        },
         ensure_ascii=False,
     )
 

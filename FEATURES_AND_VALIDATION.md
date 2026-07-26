@@ -37,8 +37,14 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 - Change an existing event — move the time, rename it, update the location
 - Cancel/remove an event
 - Find a specific event by name ("when is Sam's soccer practice?")
-- Ask for a good time for something — it'll suggest an open slot based on what's already on the calendar
+- Ask for a good time for something — it'll suggest an open slot based on what's already on the calendar. Name other registered family members who also need to be free ("a slot tomorrow that works for me and Sam") and it checks their real calendars too, not just the household's — see "Multi-user scheduling" below for how a person gets registered
 - Set a reminder for a specific time — it'll proactively message you when it comes due, without you having to ask. Defaults to Telegram, but you can ask for it by iMessage instead ("send me an iMessage reminder at 4:30 to call Grandma"). Checked every 5 minutes, so expect up to a few minutes of drift, not second-perfect timing. Reminder-by-phone-call isn't built yet (Phase 10, future)
+
+**Multi-user scheduling** (Phase 8b)
+- Create an event that other family members need to attend — name them ("schedule this with Sam and Jamie") and they're added as real Google Calendar attendees, so it shows up on their own personal calendar with a native invite, not just the household's
+- Availability checks (`suggest_meeting_time`) account for named family members' real calendars, not just the household's — and say so explicitly when someone's availability *can't* be checked (not registered, or hasn't shared their calendar yet) rather than guessing
+- Ask who's registered ("who are the family members?")
+- **Note:** this only works for people named explicitly in the request. Asking the assistant to do something "for me" doesn't yet resolve to a specific person — see Not yet built
 
 **Household lists**
 - Add something to the grocery list
@@ -49,6 +55,7 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 - Texting the household (SMS) isn't live yet — blocked on carrier registration (Phase 4b)
 - No way to ask the assistant what chores have been done recently — only add new entries
 - Reminder-by-phone-call isn't built — you can only choose Telegram or iMessage for delivery, not "call me" (Phase 10)
+- No automatic "me" resolution — the assistant can schedule around *named* family members, but "add this for me" doesn't yet know who "me" is; phrase requests with the person's actual name for now (Phase 8b)
 
 **Developer/ops tooling (not household-facing)**
 - **Benchmark different models/providers on latency and on model intelligence** (`household/ab_test/`, Phase 8 side quest) — replays a fixed conversation script against the live assistant once per model, records per-turn latency (time-to-first-token and total), and grades the two transcripts turn-by-turn with an LLM judge for a win tally, not just a speed number. Used so far to compare the local oMLX model against `gpt-5.4`; the same harness works for any future model/provider swap. See `USER_GUIDE.md`'s "Run another A/B test" for the exact steps — it's a deliberate, one-off diagnostic run (briefly repoints the live primary model), not something that runs continuously.
@@ -98,6 +105,9 @@ the actual Google app — not just the agent's word for it.
 
 13. **Any channel — weekly planning and weekly summary always use the cloud model**
     "Can you help me plan out my upcoming week?" and, separately, "can you give me a summary of the past week?" **Verify:** both responses reference real seeded calendar/grocery/chore data (not generic advice) and take noticeably longer than an ordinary local reply — these two always escalate regardless of phrasing, per the fixed Phase 8 task list.
+
+14. **Any channel — schedule around a named family member's real calendar**
+    Requires at least one other family member actually registered first (see `USER_GUIDE.md` "Add a family member" — a real Google account, calendar shared at free/busy level, entry in `family_members.json`). Ask "can you find a 30-minute slot tomorrow that works for me and \<name\>?" **Verify:** the suggested slots don't overlap that person's real calendar (cross-check directly in their Google Calendar); then "schedule a call with \<name\> at \<one of the suggested times\>" and confirm **they** receive a real Google Calendar invite with an RSVP option, not just an entry on the household calendar. Separately, ask about someone *not* registered ("...that works for me and a made-up name") — **verify:** the assistant says it can't check that person's availability rather than presenting suggestions as if they'd already accounted for them.
 
 **Not yet demoable, roadmap-flagged rather than omitted:**
 - *Anything over SMS* — blocked on Twilio A2P 10DLC registration (Phase 4b).
