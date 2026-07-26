@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Household calendar MCP server for Hermes Agent.
+"""Household MCP server for Hermes Agent — Calendar + Tasks.
 
-Exposes calendar read/write tools directly, calling the Google Calendar API
-in-process. Deliberately bypasses the bundled google-workspace skill's
-skill_view + shelled-out-script path: that route requires an extra LLM round
-trip to load instructions before the agent can even attempt a call, and its
-scripts assume a generic `python` on PATH with dependencies pre-installed,
-neither of which holds in this container (see project_plan.md Phase 6 for
-the failure this replaces).
+Exposes calendar and grocery/chore-list read/write tools directly, calling
+the Google Calendar and Tasks APIs in-process. Deliberately bypasses the
+bundled google-workspace skill's skill_view + shelled-out-script path: that
+route requires an extra LLM round trip to load instructions before the
+agent can even attempt a call, and its scripts assume a generic `python`
+on PATH with dependencies pre-installed, neither of which holds in this
+container (see project_plan.md Phase 6 for the failure this replaces).
+Google Tasks isn't covered by that bundled skill at all regardless.
 
 Reuses the OAuth token already established via the google-workspace skill's
-setup flow (~/.hermes/google_token.json), scoped to Calendar only.
+setup flow (~/.hermes/google_token.json), scoped to Calendar + Tasks.
 
 Google has since shipped its own official, remote Calendar MCP server
 (calendarmcp.googleapis.com, GA'd May 2026) with a broader tool set than
-this file. Not adopted yet — see the Phase 9 research item in
-project_plan.md before adding more surface area here.
+the calendar half of this file. Not adopted yet — see the Phase 9 research
+item in project_plan.md before adding more surface area here.
 """
 import json
 import os
@@ -39,7 +40,13 @@ except ImportError:
 
 HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/tasks",
+]
+
+GROCERY_LIST_NAME = "Groceries"
+CHORES_LIST_NAME = "Chores"
 
 # Marker in the event description that the Phase 7 reminder scheduler polls
 # for — distinguishes Hermes-created reminders from regular calendar events.
@@ -67,6 +74,23 @@ def _calendar_service():
     from googleapiclient.discovery import build
 
     return build("calendar", "v3", credentials=_get_credentials())
+
+
+def _tasks_service():
+    from googleapiclient.discovery import build
+
+    return build("tasks", "v1", credentials=_get_credentials())
+
+
+def _find_or_create_tasklist(service, title: str) -> str:
+    """Return the id of the household tasklist with this title, creating it
+    the first time it's needed."""
+    result = service.tasklists().list(maxResults=100).execute()
+    for tl in result.get("items", []):
+        if tl["title"] == title:
+            return tl["id"]
+    created = service.tasklists().insert(body={"title": title}).execute()
+    return created["id"]
 
 
 def _with_timezone(value: str) -> str:
@@ -298,6 +322,55 @@ def suggest_meeting_time(duration_minutes: int, start: str = "", end: str = "") 
             for s, _ in suggestions[:5]
         ],
         ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+def add_grocery_item(item: str) -> str:
+    """Add an item to the household grocery list.
+
+    Args:
+        item: What to add (e.g. "milk", "organic eggs").
+    """
+    service = _tasks_service()
+    list_id = _find_or_create_tasklist(service, GROCERY_LIST_NAME)
+    result = service.tasks().insert(tasklist=list_id, body={"title": item}).execute()
+    return json.dumps({"status": "added", "id": result["id"], "item": result.get("title", item)})
+
+
+@mcp.tool()
+def list_groceries() -> str:
+    """List everything currently on the household grocery list (not yet bought)."""
+    service = _tasks_service()
+    list_id = _find_or_create_tasklist(service, GROCERY_LIST_NAME)
+    result = service.tasks().list(tasklist=list_id, showCompleted=False).execute()
+    items = [{"id": t["id"], "item": t.get("title", "")} for t in result.get("items", [])]
+    return json.dumps(items, ensure_ascii=False)
+
+
+@mcp.tool()
+def log_chore(chore: str, person: str = "") -> str:
+    """Record that a household chore was completed. Use this *after* a chore
+    is done, to log it — not to schedule or assign an upcoming one.
+
+    Args:
+        chore: What was done (e.g. "took out the trash", "vacuumed living room").
+        person: Optional — who did it.
+    """
+    service = _tasks_service()
+    list_id = _find_or_create_tasklist(service, CHORES_LIST_NAME)
+    body = {"title": chore, "status": "completed"}
+    if person:
+        body["notes"] = f"Done by: {person}"
+    result = service.tasks().insert(tasklist=list_id, body=body).execute()
+    return json.dumps(
+        {
+            "status": "logged",
+            "id": result["id"],
+            "chore": result.get("title", chore),
+            "person": person,
+            "completed": result.get("status") == "completed",
+        }
     )
 
 
