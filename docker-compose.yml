@@ -2,6 +2,13 @@ services:
   hermes:
     build: .
     container_name: hermes-sandbox
+    ports:
+      # Loopback-only on the host — ngrok runs on the host and tunnels this
+      # to ElevenLabs; nothing else needs to reach it, so no reason to bind
+      # 0.0.0.0 on the host side. (The container-side bind is 0.0.0.0 per
+      # API_SERVER_HOST in .env, since Docker's forwarded traffic doesn't
+      # arrive as true loopback inside the container.)
+      - "127.0.0.1:8642:8642"
     volumes:
       # The one and only volume: this is the architecture plan's "/data" —
       # Hermes's ~/.hermes (config/memory/skills), and later the Google OAuth
