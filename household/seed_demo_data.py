@@ -101,6 +101,9 @@ def seed_calendar() -> None:
                 "description": REMINDER_TAG,
                 "start": {"dateTime": reminder_start.isoformat()},
                 "end": {"dateTime": reminder_end.isoformat()},
+                "extendedProperties": {
+                    "private": {"hermesReminder": "true", "hermesReminderSent": "false"}
+                },
             },
         )
         .execute()

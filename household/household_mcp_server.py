@@ -192,6 +192,12 @@ def set_reminder(summary: str, when: str) -> str:
         "description": REMINDER_TAG,
         "start": {"dateTime": start_dt.isoformat()},
         "end": {"dateTime": end_dt.isoformat()},
+        # extendedProperties.private is invisible in the UI (unlike the
+        # description tag above, which is just for a human glancing at the
+        # event) — the Phase 7 reminder scheduler filters on these via the
+        # Calendar API's privateExtendedProperty query param, and flips
+        # hermesReminderSent after delivering so it isn't sent twice.
+        "extendedProperties": {"private": {"hermesReminder": "true", "hermesReminderSent": "false"}},
     }
 
     service = _calendar_service()
