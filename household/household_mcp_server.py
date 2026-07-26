@@ -48,6 +48,14 @@ SCOPES = [
 GROCERY_LIST_NAME = "Groceries"
 CHORES_LIST_NAME = "Chores"
 
+# Phase 8: cloud escalation. The local oMLX model (Hermes's primary model,
+# unchanged) handles everything else; only these tools ever leave the
+# household — see project_plan.md Phase 8 for why this is deliberately
+# task-triggered rather than a complexity-judging router. OpenAI, not
+# Anthropic — the household has free daily token usage on OpenAI's models
+# and this project's usage is low-volume enough to stay well inside it.
+CLOUD_MODEL = "gpt-5.4"
+
 # Marker in the event description that the Phase 7 reminder scheduler polls
 # for — distinguishes Hermes-created reminders from regular calendar events.
 REMINDER_TAG = "[Hermes Reminder]"
@@ -406,6 +414,127 @@ def log_chore(chore: str, person: str = "") -> str:
             "completed": result.get("status") == "completed",
         }
     )
+
+
+def _get_openai_cloud_api_key() -> str:
+    """Read the cloud-escalation API key. Checks the environment first, but
+    falls back to reading ~/.hermes/.env directly — relying on this MCP
+    subprocess consistently inheriting the gateway process's environment
+    turned out to be unreliable in practice (some spawns had it, some
+    didn't, traced via project_plan.md Phase 8's live testing), so this
+    reads the same file Hermes itself loads it from, deterministically,
+    every call.
+    """
+    key = os.environ.get("OPENAI_CLOUD_API_KEY")
+    if key:
+        return key
+    for line in (HERMES_HOME / ".env").read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("OPENAI_CLOUD_API_KEY="):
+            return stripped.partition("=")[2].strip()
+    raise RuntimeError("OPENAI_CLOUD_API_KEY not found in environment or ~/.hermes/.env")
+
+
+def _call_cloud(prompt: str, *, tools: list | None = None, effort: str = "high") -> str:
+    """Call the cloud model directly for a request explicitly routed to the
+    cloud tier (see project_plan.md Phase 8) — the local oMLX model never
+    sees this prompt or its answer. Returns the response text, or a JSON
+    error envelope if the request came back empty.
+
+    effort defaults to "high" — fine for a single reasoning pass (the
+    plan/summarize tools below). Live testing found "high" effort combined
+    with the web_search tool (multiple search rounds, each adding more
+    reasoning) can take 5+ minutes and blow past Hermes's MCP tool-call
+    timeout; research_topic passes "medium" to stay responsive.
+    """
+    import openai
+
+    # Deliberately not the plain OPENAI_API_KEY env var — docker-compose.yml
+    # already claims that name as a placeholder for Hermes's own local-model
+    # OpenAI-compatible client. See the .env comment next to
+    # OPENAI_CLOUD_API_KEY for how this was found.
+    client = openai.OpenAI(api_key=_get_openai_cloud_api_key())
+    kwargs = dict(
+        model=CLOUD_MODEL,
+        input=prompt,
+        reasoning={"effort": effort},
+    )
+    if tools:
+        kwargs["tools"] = tools
+    response = client.responses.create(**kwargs)
+
+    return response.output_text or json.dumps(
+        {"status": "error", "error": "The cloud model returned no text response."}
+    )
+
+
+@mcp.tool()
+def research_topic(topic: str) -> str:
+    """Research something using a more capable cloud model with live web
+    search. Use this whenever the user explicitly asks you to "research"
+    something (e.g. "research the history of Mount Rushmore", "can you
+    research X", "look into Y for me") — that phrasing is this household's
+    signal to escalate past your own local knowledge. Do not use this for
+    routine household questions (calendar, groceries, chores) or ordinary
+    conversation — only when research/deep-lookup is explicitly requested.
+
+    Args:
+        topic: What to research, in the user's own words.
+    """
+    return _call_cloud(
+        f"Research the following and give a clear, well-sourced answer:\n\n{topic}",
+        tools=[{"type": "web_search"}],
+        effort="medium",
+    )
+
+
+@mcp.tool()
+def plan_upcoming_week() -> str:
+    """Produce a plan for the coming week using a more capable cloud model.
+    Always call this tool — instead of answering directly — whenever the
+    user asks for help planning the week ahead, a weekly game plan, or a
+    similar "what should this week look like" request. This is one of a
+    small, fixed set of household tasks that always escalate to the cloud
+    model regardless of how routine the request sounds.
+    """
+    agenda = get_agenda()
+    groceries = list_groceries()
+    prompt = (
+        "You are helping a household plan the coming week. Given the "
+        "calendar agenda and grocery list below, write a short, practical "
+        "plan for the week: flag any scheduling conflicts or tight days, "
+        "and suggest anything worth prepping ahead of time.\n\n"
+        f"Calendar (next 7 days):\n{agenda}\n\n"
+        f"Grocery list:\n{groceries}"
+    )
+    return _call_cloud(prompt)
+
+
+@mcp.tool()
+def summarize_past_week() -> str:
+    """Summarize the past week using a more capable cloud model. Always
+    call this tool — instead of answering directly — whenever the user
+    asks for a recap or summary of the past week (what happened, chores
+    done, etc). This is one of a small, fixed set of household tasks that
+    always escalate to the cloud model regardless of how routine the
+    request sounds.
+    """
+    now = datetime.now(timezone.utc)
+    agenda = get_agenda(start=(now - timedelta(days=7)).isoformat(), end=now.isoformat())
+
+    service = _tasks_service()
+    chores_list_id = _find_or_create_tasklist(service, CHORES_LIST_NAME)
+    chores = service.tasks().list(tasklist=chores_list_id, showCompleted=True, showHidden=True).execute()
+    completed = [t.get("title", "") for t in chores.get("items", []) if t.get("status") == "completed"]
+
+    prompt = (
+        "You are summarizing the past week for a household. Given the "
+        "calendar events and completed chores below, write a short, "
+        "friendly recap of the week.\n\n"
+        f"Calendar (past 7 days):\n{agenda}\n\n"
+        f"Chores completed:\n{json.dumps(completed, ensure_ascii=False)}"
+    )
+    return _call_cloud(prompt)
 
 
 if __name__ == "__main__":

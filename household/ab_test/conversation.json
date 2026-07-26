@@ -1,0 +1,12 @@
+{
+  "_comment": "Fixed script for the Phase 8 side-quest A/B test (local vs cloud primary model). Deliberately avoids any phrasing that would trigger the Phase 8 cloud-escalation tools (research_topic / plan_upcoming_week / summarize_past_week) — those call Anthropic directly regardless of which model is primary, which would make both runs look identical on those turns and defeat the comparison.",
+  "turns": [
+    "What's a safe way to defrost chicken quickly without a microwave?",
+    "In one paragraph, explain the difference between TCP and UDP.",
+    "What's on my calendar for the next 7 days?",
+    "Add oat milk and paper towels to the grocery list.",
+    "I have a friend visiting this weekend who's vegetarian and gluten-free — suggest a simple dinner menu for two nights.",
+    "Someone in the family keeps leaving the porch light on overnight — draft a short, friendly note to the group about it.",
+    "What's currently on the grocery list?"
+  ]
+}

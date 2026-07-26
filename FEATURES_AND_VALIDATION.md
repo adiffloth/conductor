@@ -26,6 +26,10 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 **General**
 - Ask ordinary questions and hold a normal conversation — answered by a local model running on the household's own hardware, not the cloud
 - Ask it to write and run a small script (e.g. a quick calculation or data-formatting task) in a sandboxed environment that can't see or touch anything else on the host computer
+- **Invoke a more capable cloud model when it's actually warranted** (Phase 8) — deliberately task-triggered, not a complexity-judging router, on the theory that a fixed, testable set of triggers beats the local model guessing whether a question is "hard enough" to escalate:
+  - Say "research X" (or a clear synonym — "look into X") and it hands the question to a cloud model with real, live web search, instead of answering from its own training data
+  - Ask it to plan out the upcoming week, or summarize the past week — both always run on the cloud model, pulling in real calendar/grocery/chore data first, regardless of how routine the request sounds
+  - Everything else — including ordinary Q&A — stays on the local model; this is not automatic for arbitrary "hard" questions
 
 **Calendar**
 - Ask what's on the calendar — a specific day, a time range, or "am I free at X?"
@@ -43,9 +47,11 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 
 **Not yet built**
 - Texting the household (SMS) isn't live yet — blocked on carrier registration (Phase 4b)
-- No automatic hand-off to a more powerful cloud model for harder questions yet (Phase 8)
 - No way to ask the assistant what chores have been done recently — only add new entries
 - Reminder-by-phone-call isn't built — you can only choose Telegram or iMessage for delivery, not "call me" (Phase 10)
+
+**Developer/ops tooling (not household-facing)**
+- **Benchmark different models/providers on latency and on model intelligence** (`household/ab_test/`, Phase 8 side quest) — replays a fixed conversation script against the live assistant once per model, records per-turn latency (time-to-first-token and total), and grades the two transcripts turn-by-turn with an LLM judge for a win tally, not just a speed number. Used so far to compare the local oMLX model against `gpt-5.4`; the same harness works for any future model/provider swap. See `USER_GUIDE.md`'s "Run another A/B test" for the exact steps — it's a deliberate, one-off diagnostic run (briefly repoints the live primary model), not something that runs continuously.
 
 ---
 
@@ -86,6 +92,12 @@ the actual Google app — not just the agent's word for it.
 
 11. **Telegram — set a reminder and ask for it by iMessage instead**
     "Send me an iMessage reminder in a few minutes to call Grandma." **Verify:** the message arrives in **iMessage**, not Telegram, even though it was set from Telegram — confirms delivery channel is a real per-reminder choice, not just wherever it happened to be set from.
+
+12. **Any channel — explicit research request escalates to the cloud model**
+    "Can you research the history of Mount Rushmore?" **Verify:** the answer is well-sourced and current (real web search, not just training-data recall) — takes roughly 5–30 seconds since it's a real round-trip to the cloud model, noticeably longer than an ordinary local-model reply. Compare against a plain factual question with no "research" wording (e.g. "what's a good substitute for buttermilk?") — that one should stay fast, confirming the cloud tool only fires on the explicit trigger.
+
+13. **Any channel — weekly planning and weekly summary always use the cloud model**
+    "Can you help me plan out my upcoming week?" and, separately, "can you give me a summary of the past week?" **Verify:** both responses reference real seeded calendar/grocery/chore data (not generic advice) and take noticeably longer than an ordinary local reply — these two always escalate regardless of phrasing, per the fixed Phase 8 task list.
 
 **Not yet demoable, roadmap-flagged rather than omitted:**
 - *Anything over SMS* — blocked on Twilio A2P 10DLC registration (Phase 4b).
