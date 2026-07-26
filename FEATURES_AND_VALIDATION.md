@@ -34,7 +34,7 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 - Cancel/remove an event
 - Find a specific event by name ("when is Sam's soccer practice?")
 - Ask for a good time for something — it'll suggest an open slot based on what's already on the calendar
-- Set a reminder for a specific time — it'll proactively message you in Telegram when it comes due, without you having to ask (checked every 5 minutes, so expect up to a few minutes of drift, not second-perfect timing)
+- Set a reminder for a specific time — it'll proactively message you when it comes due, without you having to ask. Defaults to Telegram, but you can ask for it by iMessage instead ("send me an iMessage reminder at 4:30 to call Grandma"). Checked every 5 minutes, so expect up to a few minutes of drift, not second-perfect timing. Reminder-by-phone-call isn't built yet (Phase 10, future)
 
 **Household lists**
 - Add something to the grocery list
@@ -45,7 +45,7 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 - Texting the household (SMS) isn't live yet — blocked on carrier registration (Phase 4b)
 - No automatic hand-off to a more powerful cloud model for harder questions yet (Phase 8)
 - No way to ask the assistant what chores have been done recently — only add new entries
-- Reminder delivery currently always goes to Telegram, regardless of which channel the reminder was set from
+- Reminder-by-phone-call isn't built — you can only choose Telegram or iMessage for delivery, not "call me" (Phase 10)
 
 ---
 
@@ -83,6 +83,9 @@ the actual Google app — not just the agent's word for it.
 
 10. **Voice call — set a reminder and wait for it to actually fire**
     Call and say "remind me in a few minutes to check on dinner." **Verify:** the event shows up in Google Calendar immediately (titled "Reminder: ..."); separately, with no further prompting, an unprompted Telegram message arrives once it comes due — the whole point of this one is that *nobody has to check back*, it just shows up (checked every 5 minutes, so allow a few minutes of drift).
+
+11. **Telegram — set a reminder and ask for it by iMessage instead**
+    "Send me an iMessage reminder in a few minutes to call Grandma." **Verify:** the message arrives in **iMessage**, not Telegram, even though it was set from Telegram — confirms delivery channel is a real per-reminder choice, not just wherever it happened to be set from.
 
 **Not yet demoable, roadmap-flagged rather than omitted:**
 - *Anything over SMS* — blocked on Twilio A2P 10DLC registration (Phase 4b).

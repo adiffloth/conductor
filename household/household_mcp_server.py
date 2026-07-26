@@ -173,8 +173,11 @@ def add_calendar_event(summary: str, start: str, end: str, location: str = "") -
     )
 
 
+REMINDER_CHANNELS = {"telegram", "photon"}
+
+
 @mcp.tool()
-def set_reminder(summary: str, when: str) -> str:
+def set_reminder(summary: str, when: str, channel: str = "telegram") -> str:
     """Set a reminder for a specific time.
 
     Creates a tagged calendar event that the household reminder scheduler
@@ -184,7 +187,20 @@ def set_reminder(summary: str, when: str) -> str:
     Args:
         summary: What to be reminded about.
         when: ISO 8601 datetime with timezone (e.g. 2026-07-27T15:00:00Z).
+        channel: Where to deliver it — "telegram" (default) or "photon"
+            (iMessage). Use "photon" when the user specifically asks for an
+            iMessage/text reminder rather than Telegram. Voice/phone-call
+            delivery isn't supported yet — if asked, say so rather than
+            silently falling back to another channel.
     """
+    if channel not in REMINDER_CHANNELS:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"Unknown channel '{channel}'. Supported: {sorted(REMINDER_CHANNELS)}.",
+            }
+        )
+
     start_dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
     end_dt = start_dt + timedelta(minutes=5)
     event = {
@@ -197,13 +213,25 @@ def set_reminder(summary: str, when: str) -> str:
         # event) — the Phase 7 reminder scheduler filters on these via the
         # Calendar API's privateExtendedProperty query param, and flips
         # hermesReminderSent after delivering so it isn't sent twice.
-        "extendedProperties": {"private": {"hermesReminder": "true", "hermesReminderSent": "false"}},
+        "extendedProperties": {
+            "private": {
+                "hermesReminder": "true",
+                "hermesReminderSent": "false",
+                "hermesReminderChannel": channel,
+            }
+        },
     }
 
     service = _calendar_service()
     result = service.events().insert(calendarId="primary", body=event).execute()
     return json.dumps(
-        {"status": "reminder set", "id": result["id"], "summary": result.get("summary", ""), "when": when}
+        {
+            "status": "reminder set",
+            "id": result["id"],
+            "summary": result.get("summary", ""),
+            "when": when,
+            "channel": channel,
+        }
     )
 
 
