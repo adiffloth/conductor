@@ -31,4 +31,12 @@ ENV PATH="/home/hermes/.local/bin:${PATH}"
 # ~/.hermes/hermes-agent, alongside this config file).
 COPY --chown=hermes:hermes docker/hermes-config.yaml /home/hermes/.hermes/config.yaml
 
+# Phase 6: household skill custom code (this repo). Deliberately kept
+# outside ~/.hermes — that whole tree is the named volume, so anything
+# placed there only reaches a *fresh* volume, not one that already exists.
+# Living outside it means a plain image rebuild actually updates this code.
+# Runs on Hermes's own venv interpreter (already has the google-api-python-
+# client / mcp packages installed — see project_plan.md Phase 6).
+COPY --chown=hermes:hermes household/ /home/hermes/household/
+
 CMD ["/bin/bash"]

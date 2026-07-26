@@ -2,8 +2,3 @@
 .venv/
 __pycache__/
 *.pyc
-
-# Google OAuth client secrets downloaded from Cloud Console — staged here
-# temporarily to hand off into the container, then moved out by the user.
-client_secret*.json
-google_token.json
