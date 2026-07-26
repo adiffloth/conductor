@@ -44,7 +44,7 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 - Create an event that other family members need to attend — name them ("schedule this with Sam and Jamie") and they're added as real Google Calendar attendees, so it shows up on their own personal calendar with a native invite, not just the household's
 - Availability checks (`suggest_meeting_time`) account for named family members' real calendars, not just the household's — and say so explicitly when someone's availability *can't* be checked (not registered, or hasn't shared their calendar yet) rather than guessing
 - Ask who's registered ("who are the family members?")
-- **Note:** this only works for people named explicitly in the request. Asking the assistant to do something "for me" doesn't yet resolve to a specific person — see Not yet built
+- **"For me" resolves automatically over DM** (Telegram or iMessage/Photon), for anyone registered with their channel ID — "am I free tomorrow?" or "add this for me" resolves to that person the same way a named third party would, with no need to say their own name. Only works one-to-one in a direct message, not in a group chat (Hermes's own group-chat sender-tagging already exists and is left as-is). A registered person without a channel ID on file — or someone not registered at all — falls back to today's behavior (household-calendar-only, no personal resolution) rather than guessing.
 
 **Household lists**
 - Add something to the grocery list
@@ -55,7 +55,7 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 - Texting the household (SMS) isn't live yet — blocked on carrier registration (Phase 4b)
 - No way to ask the assistant what chores have been done recently — only add new entries
 - Reminder-by-phone-call isn't built — you can only choose Telegram or iMessage for delivery, not "call me" (Phase 10)
-- No automatic "me" resolution — the assistant can schedule around *named* family members, but "add this for me" doesn't yet know who "me" is; phrase requests with the person's actual name for now (Phase 8b)
+- "For me" resolution only works one-to-one over DM (Telegram/Photon), and only for people registered with a `telegram_id`/`phone` — in a group chat, or for anyone without a channel ID on file, phrase requests with the person's actual name instead (Phase 8b)
 
 **Developer/ops tooling (not household-facing)**
 - **Benchmark different models/providers on latency and on model intelligence** (`household/ab_test/`, Phase 8 side quest) — replays a fixed conversation script against the live assistant once per model, records per-turn latency (time-to-first-token and total), and grades the two transcripts turn-by-turn with an LLM judge for a win tally, not just a speed number. Used so far to compare the local oMLX model against `gpt-5.4`; the same harness works for any future model/provider swap. See `USER_GUIDE.md`'s "Run another A/B test" for the exact steps — it's a deliberate, one-off diagnostic run (briefly repoints the live primary model), not something that runs continuously.
@@ -108,6 +108,9 @@ the actual Google app — not just the agent's word for it.
 
 14. **Any channel — schedule around a named family member's real calendar**
     Requires at least one other family member actually registered first (see `USER_GUIDE.md` "Add a family member" — a real Google account, calendar shared at free/busy level, entry in `family_members.json`). Ask "can you find a 30-minute slot tomorrow that works for me and \<name\>?" **Verify:** the suggested slots don't overlap that person's real calendar (cross-check directly in their Google Calendar); then "schedule a call with \<name\> at \<one of the suggested times\>" and confirm **they** receive a real Google Calendar invite with an RSVP option, not just an entry on the household calendar. Separately, ask about someone *not* registered ("...that works for me and a made-up name") — **verify:** the assistant says it can't check that person's availability rather than presenting suggestions as if they'd already accounted for them.
+
+15. **Telegram or iMessage DM — "me" resolves without saying your own name**
+    Requires a family member registered with a `telegram_id` or `phone` (see `USER_GUIDE.md` "Add a family member"). From *that person's own account*, DM the bot directly (not a group chat) and ask "am I free tomorrow afternoon?" **Verify:** the response reflects that specific person's real calendar, and, revealingly, ask the bot afterward "who did you think was asking?" — it should name them correctly. Then, from a *different*, unregistered phone/Telegram account (or one without a channel ID on file), ask the same question — **verify:** it falls back to today's behavior (household calendar only) rather than guessing or misattributing the request to someone else.
 
 **Not yet demoable, roadmap-flagged rather than omitted:**
 - *Anything over SMS* — blocked on Twilio A2P 10DLC registration (Phase 4b).

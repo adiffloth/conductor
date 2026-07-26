@@ -35,7 +35,7 @@ oMLX itself) run on the host outside Docker.
 | `.gitignore` | Also excludes `.venv/`, `__pycache__/`, `.DS_Store`, `*.pyc` |
 | `docker/hermes-config.yaml` | Hermes's runtime config, baked into the image at build time (model provider, terminal backend) |
 | `docker/sync-env.py` | Utility script: merges `.env`'s keys into the container's `~/.hermes/.env` without ever putting a secret on a host command line |
-| `household/household_mcp_server.py` | **The core custom code.** An MCP server exposing Calendar (7 tools), Tasks/grocery/chore (3 tools), and cloud escalation (3 tools: `research_topic`, `plan_upcoming_week`, `summarize_past_week` — Phase 8) directly to Hermes — no shell-outs, no generic skill-discovery indirection |
+| `household/household_mcp_server.py` | **The core custom code.** An MCP server exposing Calendar (7 tools), Tasks/grocery/chore (3 tools), multi-user scheduling (`list_family_members` — Phase 8b), and cloud escalation (3 tools: `research_topic`, `plan_upcoming_week`, `summarize_past_week` — Phase 8) directly to Hermes — 14 tools total, no shell-outs, no generic skill-discovery indirection |
 | `household/reminder_scheduler.py` | Phase 7: polls Calendar for due reminders, delivers via `hermes send` (Telegram or iMessage, per-reminder choice), marks them sent |
 | `household/cron_entrypoint.py` | A required 3-line wrapper — `hermes cron` only accepts real files directly under `~/.hermes/scripts/`, not symlinks elsewhere. This gets copied there once; the real logic stays in `reminder_scheduler.py` |
 | `household/seed_demo_data.py` | Populates realistic calendar events / grocery items / chore-log entries, relative to "today". Re-run before a demo to refresh dates |
@@ -43,14 +43,15 @@ oMLX itself) run on the host outside Docker.
 | `household/ab_test/run_ab_test.py` | Replays the script against the live API Server, records per-turn latency + transcript to `household/ab_test/results/<label>.json` |
 | `household/ab_test/judge_eval.py` | Grades two transcripts turn-by-turn using an LLM judge (`gpt-5.4`), reports a win tally + avg latency |
 | `household/ab_test/results/` | Gitignored — local test artifacts only, not committed |
-| `family_members.json` | Multi-user scheduling registry (name → email). Not committed — PII, same treatment as `.env`. See "Add a family member" below |
+| `family_members.json` | Multi-user scheduling registry (name → email, + optional telegram_id/phone). Not committed — PII, same treatment as `.env`. See "Add a family member" below |
+| `household/plugins/household_identity/` | Hermes plugin (Phase 8b part 2) — resolves a DM sender's registered name via `family_members.json` and prefixes it onto the message text, so "add this for me" resolves like a named third party would. DM-only, deliberately doesn't touch group chats (Hermes's own mechanism already handles those) |
 
 **Inside the container, NOT in this repo** (lives in the `hermes_data` Docker
 volume, persists across container recreation but not across a volume wipe):
 
 | Path | What it is |
 |---|---|
-| `~/.hermes/config.yaml` | Runtime config — model, `terminal.backend`, `platform_toolsets` (which tools each channel can use), `mcp_servers` (our household server registration), `plugins.enabled` (Photon) |
+| `~/.hermes/config.yaml` | Runtime config — model, `terminal.backend`, `platform_toolsets` (which tools each channel can use), `mcp_servers` (our household server registration), `plugins.enabled` (Photon, household-identity) |
 | `~/.hermes/.env` | Secrets, synced from this repo's `.env` (see "Common tasks" below) |
 | `~/.hermes/google_token.json` | Google OAuth token (Calendar + Tasks scopes) |
 | `~/.hermes/google_client_secret.json` | Google OAuth client credentials |
@@ -69,9 +70,12 @@ all of them with the snapshot command at the bottom of this section.
 
 ### 1. oMLX (bare-metal on the host, not Docker)
 The menubar app, already running with `Qwen3.6-35B-A3B-MLX-6bit` loaded
-(the active model — `Hermes-4.3-36B-mlx-5Bit` is also downloaded, queued as
-a future A/B comparison, see project_plan.md Decision 2). Not something
-this repo starts/stops — just needs to be running with the model loaded.
+(the active *local* model — `Hermes-4.3-36B-mlx-5Bit` is also downloaded,
+queued as a future **local-model-vs-local-model** comparison, see
+project_plan.md Decision 2. Not the same thing as the **local-vs-cloud**
+A/B harness below — that one compares this local model against OpenAI, not
+against another local model). Not something this repo starts/stops — just
+needs to be running with the model loaded.
 Check: `curl http://127.0.0.1:8000/v1/models`
 
 ### 2. The Hermes container
@@ -90,9 +94,9 @@ docker exec hermes-sandbox hermes gateway status
 docker exec hermes-sandbox hermes gateway stop
 ```
 **Restart it (stop, then start again) after any change to:** `config.yaml`,
-`.env` secrets, the household MCP server code, or the cron job definition.
-It does not hot-reload. `hermes cron` jobs are ticked by this same process
-— no separate scheduler to manage.
+`.env` secrets, the household MCP server code, plugin code, or the cron
+job definition. It does not hot-reload. `hermes cron` jobs are ticked by
+this same process — no separate scheduler to manage.
 
 ### 4. ngrok (bare-metal on the host, not Docker)
 Tunnels the container's API Server port so ElevenLabs (voice) can reach it.
@@ -120,7 +124,7 @@ curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
 | **Telegram** (BotFather) | Bot `@FamilyConductorBot` | `.env`: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` |
 | **Photon** (photon.codes) | iMessage, free tier | `~/.hermes/.env` in-container: `PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET` (set via `hermes photon` device-login flow, not this repo's `.env`); `.env`: `PHOTON_SIDECAR_TOKEN` (pinned, needed for the reminder scheduler to deliver standalone) |
 | **Twilio** | Phone number for Voice; SMS still blocked on A2P 10DLC | `.env`: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` |
-| **ElevenLabs** | Conversational AI agent (voice), free tier | Configured in their dashboard, not in this repo — Custom LLM Server URL = the ngrok URL + `/v1`, secret named `OPENAI_API_KEY` = `.env`'s `API_SERVER_KEY` |
+| **ElevenLabs** | Conversational AI agent (voice), free tier | Configured in their dashboard, not in this repo — Custom LLM Server URL = the ngrok URL + `/v1`, secret named `OPENAI_API_KEY` = `.env`'s `API_SERVER_KEY`. **Unrelated naming coincidence, not the same value:** this is ElevenLabs' own required literal secret name in *their* dashboard, holding our bearer token — nothing to do with the container-level `OPENAI_API_KEY` placeholder discussed under "OpenAI, specifically" below. Two different systems happen to use the same env var name for two different things. |
 | **ngrok** | Public tunnel for the Voice/API Server port | Reserved domain `pumped-prawn-sadly.ngrok-free.app`, authtoken already configured in the host's ngrok install (not this repo) |
 | **Google Cloud** | Calendar + Tasks APIs | See below |
 | **OpenAI** | Cloud escalation (Phase 8) — `research_topic`, `plan_upcoming_week`, `summarize_past_week` | See below |
@@ -151,6 +155,19 @@ docker cp household/household_mcp_server.py hermes-sandbox:/home/hermes/househol
 docker exec hermes-sandbox hermes gateway stop
 docker exec -d hermes-sandbox hermes gateway run
 ```
+
+**Push a plugin code change** (`household/plugins/household_identity/`, or any future plugin — different deploy path than `household_mcp_server.py`, since Hermes only discovers plugins from specific fixed locations):
+```bash
+docker cp household/plugins/household_identity hermes-sandbox:/home/hermes/.hermes/plugins/household_identity
+docker exec -u root hermes-sandbox chown -R hermes:hermes /home/hermes/.hermes/plugins/household_identity
+docker exec hermes-sandbox hermes gateway stop
+docker exec -d hermes-sandbox hermes gateway run
+```
+A brand-new plugin also needs enabling once — `hermes plugins list` shows
+its status; `hermes plugins enable <name>` (the `name:` field from its
+`plugin.yaml`, not the directory name — they can differ) turns it on. Only
+needed the first time; edits to an already-enabled plugin just need the
+`docker cp` + restart above.
 
 **Re-sync secrets after the container was recreated** (`docker compose up -d` after a Dockerfile change wipes nothing in the volume, but a fresh volume needs this):
 ```bash
@@ -209,6 +226,16 @@ Two separate steps — one the family member does themselves in their own
 Google account, one you do in this repo. Order doesn't matter, but nothing
 works until both are done.
 
+> **Pick their `name` carefully and use it consistently everywhere** —
+> the calendar-sharing step below, `family_members.json`, and how the
+> household actually talks about that person all need to line up. Matching
+> is exact (case-insensitive, no fuzzy/nickname matching), and the *same*
+> name is what resolves both "schedule this for Sam" (a third party naming
+> someone else) and Sam's own "add this for me" (via the DM sender-name
+> resolution below) — so if the household sometimes says "Sam" and
+> sometimes "Samantha", pick one and use it in the registry and going
+> forward, rather than registering both as if they were different people.
+
 *Step 1 — the family member shares free/busy access with the household
 account* (their own action, in their own Google Calendar — nothing to
 install, no OAuth flow):
@@ -228,10 +255,23 @@ install, no OAuth flow):
 *Step 2 — register them in `family_members.json`* (your action, this repo):
 ```bash
 # Edit family_members.json at the repo root, e.g.:
-# {"family_members": [{"name": "Sam", "email": "sam@gmail.com"}]}
-# "name" is what people will say in conversation ("schedule this for Sam")
-# — match matters exactly (case-insensitive, no fuzzy matching, so "Sam"
-# and "Samantha" are different entries if that's how the household talks).
+# {"family_members": [{"name": "Sam", "email": "sam@gmail.com", "telegram_id": "111111111", "phone": "+15551234567"}]}
+#
+# name         — what people say in conversation ("schedule this for Sam").
+#                See the note above on picking one and sticking with it.
+# email        — their Google account (free/busy sharing target + calendar invites).
+# telegram_id  — optional. Their own numeric Telegram user ID (get it from
+#                @userinfobot, same value TELEGRAM_ALLOWED_USERS uses for
+#                that person). Only needed if they DM the bot on Telegram.
+# phone        — optional. Their own E.164 number (same value
+#                PHOTON_ALLOWED_USERS uses for that person). Only needed if
+#                they DM the bot via iMessage/Photon.
+#
+# telegram_id/phone enable "add this for me"-style DM requests to resolve
+# to that person automatically (Phase 8b part 2) — without one, that
+# channel's DMs from them still work for everything else, they just won't
+# get the "for me" auto-resolution; naming them explicitly ("for Sam")
+# always works regardless.
 
 docker cp family_members.json hermes-sandbox:/home/hermes/.hermes/family_members.json
 docker exec -u root hermes-sandbox chown hermes:hermes /home/hermes/.hermes/family_members.json
@@ -242,6 +282,15 @@ The explicit `chown` matters — `docker cp` preserves the *host* file's
 ownership, which doesn't match the `hermes` user inside the container, and
 the gateway/tools run as `hermes`. Skipping it means the file silently
 can't be read (or, worse, an earlier copy silently can't be overwritten).
+
+**Verify "for me" resolution** (if you set `telegram_id`/`phone`): DM the
+bot from that person's own account and ask something like "am I free
+tomorrow?" or "add a reminder for me." It should resolve to them without
+them naming themselves — internally, a plugin (`household/plugins/
+household_identity/`, see project_plan.md "Multi-user support" part 2)
+prefixes their name onto the message before the model ever sees it, the
+same way Hermes's own group-chat mechanism already tags senders — so the
+model treats "me" exactly like it'd treat a named third party.
 
 **Verify it worked** — ask (from any channel): *"who are the registered
 family members?"* and *"can you find a 30-minute slot tomorrow that works

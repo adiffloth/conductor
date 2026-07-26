@@ -1,0 +1,6 @@
+name: household-identity
+version: 1.0.0
+description: "Resolves the sender's registered family-member name for 1:1 DMs (Telegram, iMessage/Photon) and prefixes it onto the message text, mirroring the format Hermes's own group-chat mechanism already uses, so the model knows who it's talking to even in a DM. Identity comes from the already-authenticated channel layer (allowlist-gated user_id/phone), not from message text. See household/household_mcp_server.py and project_plan.md 'Multi-user support' for the rest of the household-scheduling feature this supports."
+author: "conductor (this repo)"
+hooks:
+  - pre_gateway_dispatch
