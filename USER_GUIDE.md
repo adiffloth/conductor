@@ -1,0 +1,201 @@
+# User Guide — Operating This Project
+
+A practical reference for picking this project back up: where things live,
+how to start/stop the pieces, and what external accounts it depends on.
+Not the build history — see `project_plan.md` for that (chronological,
+detailed, includes every decision and gotcha hit along the way). Not the
+feature list either — see `FEATURES_AND_VALIDATION.md` for what the
+assistant can actually do and how to demo it.
+
+---
+
+## What this is, in one paragraph
+
+A household AI assistant ("Hermes") reachable over Telegram, iMessage, and
+phone calls, running mostly on a local LLM on this Mac Studio (via oMLX),
+with a small amount of custom code (this repo) giving it Google
+Calendar/Tasks access. Everything Hermes-related runs inside one Docker
+container; oMLX runs bare-metal on the host; a couple of things (ngrok,
+oMLX itself) run on the host outside Docker.
+
+---
+
+## Where things live
+
+**This repo (`conductor/`):**
+
+| Path | What it is |
+|---|---|
+| `README.md` | Original project brief — the four target scenarios, tech stack as originally envisioned |
+| `project_plan.md` | Full build log, phase by phase, every decision and its reasoning, every bug hit and how it was fixed. The source of truth for "why is it built this way" |
+| `FEATURES_AND_VALIDATION.md` | What the assistant can do, in plain language, plus demo scenarios to manually validate it |
+| `USER_GUIDE.md` | This file |
+| `Dockerfile`, `docker-compose.yml` | The sandbox container definition |
+| `.env` | **All secrets. Not committed (gitignored). Lives only on this machine.** Synced into the container manually (see below) — Docker Compose doesn't read it directly |
+| `.gitignore` | Also excludes `.venv/`, `__pycache__/`, `.DS_Store`, `*.pyc` |
+| `docker/hermes-config.yaml` | Hermes's runtime config, baked into the image at build time (model provider, terminal backend) |
+| `docker/sync-env.py` | Utility script: merges `.env`'s keys into the container's `~/.hermes/.env` without ever putting a secret on a host command line |
+| `household/household_mcp_server.py` | **The core custom code.** An MCP server exposing Calendar (7 tools) and Tasks/grocery/chore (3 tools) directly to Hermes — no shell-outs, no generic skill-discovery indirection |
+| `household/reminder_scheduler.py` | Phase 7: polls Calendar for due reminders, delivers via `hermes send` (Telegram or iMessage, per-reminder choice), marks them sent |
+| `household/cron_entrypoint.py` | A required 3-line wrapper — `hermes cron` only accepts real files directly under `~/.hermes/scripts/`, not symlinks elsewhere. This gets copied there once; the real logic stays in `reminder_scheduler.py` |
+| `household/seed_demo_data.py` | Populates realistic calendar events / grocery items / chore-log entries, relative to "today". Re-run before a demo to refresh dates |
+
+**Inside the container, NOT in this repo** (lives in the `hermes_data` Docker
+volume, persists across container recreation but not across a volume wipe):
+
+| Path | What it is |
+|---|---|
+| `~/.hermes/config.yaml` | Runtime config — model, `terminal.backend`, `platform_toolsets` (which tools each channel can use), `mcp_servers` (our household server registration), `plugins.enabled` (Photon) |
+| `~/.hermes/.env` | Secrets, synced from this repo's `.env` (see "Common tasks" below) |
+| `~/.hermes/google_token.json` | Google OAuth token (Calendar + Tasks scopes) |
+| `~/.hermes/google_client_secret.json` | Google OAuth client credentials |
+| `~/.hermes/scripts/household_reminders.py` | The cron entrypoint wrapper (copy of `household/cron_entrypoint.py`) |
+| `~/.hermes/logs/gateway.log` | Platform connect/disconnect, message-level activity — **the first place to look when something doesn't work** |
+| `~/.hermes/logs/agent.log` | Per-turn reasoning/tool-call trace — noisier, useful for "why did it do that" |
+| `~/.hermes/logs/errors.log` | Just the warnings/errors across everything |
+
+---
+
+## The moving parts, and how to start/stop each
+
+Four things have to be running for the assistant to work end to end. Check
+all of them with the snapshot command at the bottom of this section.
+
+### 1. oMLX (bare-metal on the host, not Docker)
+The menubar app, already running with `Qwen3.6-35B-A3B-MLX-6bit` loaded
+(the active model — `Hermes-4.3-36B-mlx-5Bit` is also downloaded, queued as
+a future A/B comparison, see project_plan.md Decision 2). Not something
+this repo starts/stops — just needs to be running with the model loaded.
+Check: `curl http://127.0.0.1:8000/v1/models`
+
+### 2. The Hermes container
+```bash
+docker compose up -d          # start (or recreate after Dockerfile/compose changes)
+docker compose build          # rebuild the image after a Dockerfile change
+docker compose down           # stop and remove the container (volume persists)
+```
+Container name: `hermes-sandbox`.
+
+### 3. The Hermes gateway (Telegram + Photon + API Server, inside the container)
+This is a foreground process — start it detached:
+```bash
+docker exec -d hermes-sandbox hermes gateway run
+docker exec hermes-sandbox hermes gateway status
+docker exec hermes-sandbox hermes gateway stop
+```
+**Restart it (stop, then start again) after any change to:** `config.yaml`,
+`.env` secrets, the household MCP server code, or the cron job definition.
+It does not hot-reload. `hermes cron` jobs are ticked by this same process
+— no separate scheduler to manage.
+
+### 4. ngrok (bare-metal on the host, not Docker)
+Tunnels the container's API Server port so ElevenLabs (voice) can reach it.
+```bash
+ngrok http --domain=pumped-prawn-sadly.ngrok-free.app 8642
+```
+Not needed for Telegram or iMessage (Photon) — both are outbound-initiated
+from the container, no public endpoint required. Only Voice needs this.
+
+### Full stack snapshot (paste this to check everything at once)
+```bash
+docker compose ps
+docker exec hermes-sandbox hermes gateway status
+docker exec hermes-sandbox hermes cron list
+curl -s http://127.0.0.1:4040/api/tunnels | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
+```
+
+---
+
+## External accounts and services
+
+| Service | What it's for | Where the credential lives |
+|---|---|---|
+| **Telegram** (BotFather) | Bot `@FamilyConductorBot` | `.env`: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` |
+| **Photon** (photon.codes) | iMessage, free tier | `~/.hermes/.env` in-container: `PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET` (set via `hermes photon` device-login flow, not this repo's `.env`); `.env`: `PHOTON_SIDECAR_TOKEN` (pinned, needed for the reminder scheduler to deliver standalone) |
+| **Twilio** | Phone number for Voice; SMS still blocked on A2P 10DLC | `.env`: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` |
+| **ElevenLabs** | Conversational AI agent (voice), free tier | Configured in their dashboard, not in this repo — Custom LLM Server URL = the ngrok URL + `/v1`, secret named `OPENAI_API_KEY` = `.env`'s `API_SERVER_KEY` |
+| **ngrok** | Public tunnel for the Voice/API Server port | Reserved domain `pumped-prawn-sadly.ngrok-free.app`, authtoken already configured in the host's ngrok install (not this repo) |
+| **Google Cloud** | Calendar + Tasks APIs | See below |
+
+### Google, specifically
+
+- **Cloud project ID:** `227341610220` (no dedicated name recorded — same project, both APIs)
+- **APIs enabled:** Calendar API, Tasks API — both had to be enabled individually; granting an OAuth scope does **not** imply the API itself is enabled (hit this exact 403 with Tasks)
+- **OAuth client type:** Desktop app (matters — Google's own official Calendar MCP server requires a *Web application* client instead, a real blocker if that's ever adopted, see project_plan.md Phase 9 research item)
+- **Scopes granted, single consent covering both:** `https://www.googleapis.com/auth/calendar`, `https://www.googleapis.com/auth/tasks` — deliberately trimmed down from the bundled google-workspace skill's much broader default (which also requests Gmail send/modify, Drive, Contacts, Sheets, Docs)
+- **Whose Google account:** the household's own personal Gmail account — data lives in that account's real Calendar (`primary`) and two auto-created Tasks lists ("Groceries", "Chores")
+- **If the token ever needs regenerating:** `google-workspace` skill's `scripts/setup.py --revoke` then `--auth-url` / `--auth-code`, run via `/home/hermes/.hermes/hermes-agent/venv/bin/python3.11` (not the bare `python3.11` — that's a different, dependency-less interpreter). Full walkthrough in project_plan.md Phase 6.
+
+---
+
+## Common tasks
+
+**Push a household/ code change into the running container** (no rebuild needed for household/ files):
+```bash
+docker cp household/household_mcp_server.py hermes-sandbox:/home/hermes/household/household_mcp_server.py
+docker exec hermes-sandbox hermes gateway stop
+docker exec -d hermes-sandbox hermes gateway run
+```
+
+**Re-sync secrets after the container was recreated** (`docker compose up -d` after a Dockerfile change wipes nothing in the volume, but a fresh volume needs this):
+```bash
+docker cp docker/sync-env.py hermes-sandbox:/tmp/sync-env.py
+docker cp .env hermes-sandbox:/tmp/incoming.env
+docker exec -u root hermes-sandbox python3.11 /tmp/sync-env.py /tmp/incoming.env /home/hermes/.hermes/.env
+docker exec -u root hermes-sandbox chown hermes:hermes /home/hermes/.hermes/.env
+docker exec -u root hermes-sandbox rm -f /tmp/incoming.env /tmp/sync-env.py
+```
+
+**Test an MCP tool directly, bypassing any channel** (fastest way to check if a bug is in the tool or in the model's usage of it):
+```bash
+docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11 -c "
+import asyncio, json
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+async def main():
+    params = StdioServerParameters(
+        command='/home/hermes/.hermes/hermes-agent/venv/bin/python3.11',
+        args=['/home/hermes/household/household_mcp_server.py'],
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            r = await session.call_tool('get_agenda', {})
+            print(r.content[0].text)
+
+asyncio.run(main())
+"
+```
+
+**Test a change without waiting for a real conversation** — a fresh API Server session, bypassing Telegram/Photon/Voice entirely:
+```bash
+source .env
+curl -s http://127.0.0.1:8642/v1/chat/completions -X POST \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${API_SERVER_KEY}" \
+  -H "X-Hermes-Session-Id: test-$(date +%s)" \
+  -d '{"model":"hermes-agent","messages":[{"role":"user","content":"YOUR QUESTION"}],"stream":false}'
+```
+Use a **fresh, unique** session ID every time — reusing one (or using
+`hermes -z` repeatedly, which continues the last session by default) means
+the model can end up citing its own earlier answer from before a bug was
+fixed, which looks exactly like the bug is still there when it isn't.
+
+**Refresh demo data before showing this to someone:**
+```bash
+docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11 \
+    /home/hermes/household/seed_demo_data.py
+```
+
+---
+
+## What's not built yet
+
+Don't re-derive this from scratch — `FEATURES_AND_VALIDATION.md`'s "Not yet
+built" section is the current, maintained list (SMS, cloud escalation,
+chore-history read-back, reminder-by-phone-call). `project_plan.md`'s phase
+list shows what's next (Phase 4b, 8, 9, 10) and what's deliberately
+deferred with reasoning (e.g. the Photon latency investigation, whether to
+adopt Google's own Calendar MCP server).
