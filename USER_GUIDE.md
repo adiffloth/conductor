@@ -30,6 +30,7 @@ oMLX itself) run on the host outside Docker.
 | `project_plan.md` | Full build log, phase by phase, every decision and its reasoning, every bug hit and how it was fixed. The source of truth for "why is it built this way" |
 | `FEATURES_AND_VALIDATION.md` | What the assistant can do, in plain language, plus demo scenarios to manually validate it |
 | `USER_GUIDE.md` | This file |
+| `PRODUCT_BRIEF.html` | A designed, one-page HTML brief (capabilities, architecture, principles, example use cases) — for sharing outside the repo, not a working doc. Open directly in a browser, or publish as a Claude Artifact to get a shareable link |
 | `Dockerfile`, `docker-compose.yml` | The sandbox container definition |
 | `.env` | **All secrets. Not committed (gitignored). Lives only on this machine.** Synced into the container manually (see below) — Docker Compose doesn't read it directly |
 | `.gitignore` | Also excludes `.venv/`, `__pycache__/`, `.DS_Store`, `*.pyc` |

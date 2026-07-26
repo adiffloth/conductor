@@ -77,7 +77,66 @@ flowchart TB
     SCHED -.reminder fires.-> TWILIO
 ```
 
-> This diagram is the **original, pre-implementation** sketch from this planning phase — kept as-is for historical record rather than maintained as a living systems diagram (same reasoning as the strikethrough-and-note treatment used for superseded decisions below, e.g. Decision 1/2). It has since diverged in real ways: the `ANTHROPIC` node is OpenAI in practice (Decision 1, Phase 8), and it predates the household MCP server's actual tool set, the multi-user/family-registry mechanism, the local-vs-cloud A/B harness, and the `household-identity` plugin (all Phase 6–8b). For current architecture, read the phase entries below, not this diagram.
+> This diagram is the **original, pre-implementation** sketch from this planning phase — kept as-is for historical record rather than maintained as a living systems diagram (same reasoning as the strikethrough-and-note treatment used for superseded decisions below, e.g. Decision 1/2). It has since diverged in real ways: the `ANTHROPIC` node is OpenAI in practice (Decision 1, Phase 8), and it predates the household MCP server's actual tool set, the multi-user/family-registry mechanism, the local-vs-cloud A/B harness, and the `household-identity` plugin (all Phase 6–8b). See the current-architecture diagram below for what's actually running.
+
+### Current architecture (as of Phase 8b, 2026-07-26)
+
+What the plan above became in practice — same overall shape (one sandbox container, oMLX bare-metal on the host, Google as the household data backend), but SMS never went live, Photon replaced it as the real interim/parallel text channel, the cloud-escalation provider is OpenAI rather than Anthropic and is invoked directly from custom tools rather than through Hermes's own provider config, and two capabilities the original plan didn't anticipate at all got added: multi-user scheduling against family members' own Google calendars, and a plugin that resolves DM sender identity.
+
+```mermaid
+flowchart TB
+    subgraph HOST["Mac Studio (M4 Max, 64GB) — bare macOS"]
+        OMLX["oMLX menubar app\nOpenAI-compat API :8000\nQwen3.6-35B-A3B-MLX-6bit (local model)"]
+        NGROK["ngrok agent\n(tunnels :8642 API Server for ElevenLabs)"]
+
+        subgraph DOCKER["Docker Desktop — container 'hermes-sandbox'"]
+            HERMES["Hermes Agent gateway process\nTelegram + Photon + API Server (:8642)\nSMS configured, not connected (pending A2P)\nterminal backend: local, jailed to container"]
+            PLUGIN["household-identity plugin\n(pre_gateway_dispatch hook, in-process)\nDM sender -> registered family-member name"]
+            MCP["household_mcp_server.py\n(MCP subprocess, 14 tools)\ncalendar + tasks + multi-user + cloud escalation"]
+            PHOTONSC["Photon Node sidecar\n(spectrum-ts gRPC, loopback :8789)"]
+            SCHED["reminder scheduler\n(hermes cron, every 5 min)"]
+            VOL[("hermes_data volume\nconfig.yaml, .env, google_token.json,\nfamily_members.json")]
+        end
+    end
+
+    subgraph CLOUD["Cloud services"]
+        TG["Telegram Bot API"]
+        PHOTONCLOUD["Photon / Spectrum cloud\n(per-person assigned iMessage lines)"]
+        TWILIO["Twilio\n(Voice -> ElevenLabs; SMS pending A2P)"]
+        ELEVEN["ElevenLabs Conversational AI"]
+        OPENAI["OpenAI API (gpt-5.4)\nresearch_topic, plan_upcoming_week,\nsummarize_past_week + A/B-test cloud arm"]
+        GOOGLE["Google Calendar + Tasks\n(household account — hub calendar,\nGroceries/Chores lists)"]
+        FAMCAL[("Each family member's own\nGoogle Calendar — shared\nfree/busy-only with the household")]
+    end
+
+    FAMILY(("Family members\nTelegram / iPhone / any phone"))
+
+    FAMILY <--> TG
+    FAMILY <-->|iMessage| PHOTONCLOUD
+    FAMILY <-->|phone call| TWILIO
+
+    TG <--> HERMES
+    PHOTONSC <-->|persistent gRPC| PHOTONCLOUD
+    HERMES <--> PHOTONSC
+    TWILIO <--> ELEVEN
+    ELEVEN -->|custom LLM webhook| NGROK --> HERMES
+
+    HERMES --> PLUGIN
+    PLUGIN -. resolves DM sender, tags message .-> HERMES
+    HERMES --> OMLX
+    HERMES <-->|stdio MCP| MCP
+    MCP <-->|events, tasklists, freebusy| GOOGLE
+    MCP -. freebusy check + attendee invite .-> FAMCAL
+    MCP -. explicit trigger: research/plan/summarize .-> OPENAI
+
+    HERMES <--> VOL
+    MCP -.-> VOL
+    PLUGIN -.-> VOL
+    SCHED <--> VOL
+    SCHED -->|poll due reminders| GOOGLE
+    SCHED -.-> TG
+    SCHED -.-> PHOTONCLOUD
+```
 
 ### Component responsibilities
 
