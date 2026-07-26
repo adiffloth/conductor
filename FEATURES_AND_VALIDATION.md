@@ -24,28 +24,28 @@ docker exec hermes-sandbox /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
 - SMS — not yet live, blocked on Twilio A2P 10DLC carrier registration (Phase 4b)
 
 **General**
-- Conversational Q&A via the local model (oMLX, currently `Qwen3.6-35B-A3B-MLX-6bit`) — no cloud calls for routine questions
-- Sandboxed terminal / code execution (no host filesystem access) — README Scenario 4
+- Ask ordinary questions and hold a normal conversation — answered by a local model running on the household's own hardware, not the cloud
+- Ask it to write and run a small script (e.g. a quick calculation or data-formatting task) in a sandboxed environment that can't see or touch anything else on the host computer
 
-**Calendar** (`household_mcp_server.py`, 7 tools)
-- `get_agenda` — what's scheduled in a time range
-- `add_calendar_event` — create an event
-- `update_calendar_event` — change an existing event (only the fields you specify)
-- `delete_calendar_event` — remove an event
-- `search_calendar_events` — find an event by text
-- `suggest_meeting_time` — find open slots (free/busy based, not working-hours aware)
-- `set_reminder` — create a tagged reminder event — **proactive delivery isn't built yet** (Phase 7); this only creates the calendar entry today, nothing fires when it comes due
+**Calendar**
+- Ask what's on the calendar — a specific day, a time range, or "am I free at X?"
+- Add a new event
+- Change an existing event — move the time, rename it, update the location
+- Cancel/remove an event
+- Find a specific event by name ("when is Sam's soccer practice?")
+- Ask for a good time for something — it'll suggest an open slot based on what's already on the calendar
+- Set a reminder for a specific time — **note: this saves the reminder, but nothing proactively notifies anyone yet when it comes due** (that piece isn't built)
 
-**Tasks / household lists** (`household_mcp_server.py`, 3 tools)
-- `add_grocery_item`
-- `list_groceries`
-- `log_chore` — records a chore as already completed (a log, not a pending-task tracker). **No read/list tool for chore history yet** — verify these via the Google Tasks app, not by asking the agent to recall them
+**Household lists**
+- Add something to the grocery list
+- Ask what's currently on the grocery list
+- Tell it a chore was just done, so there's a record of it — **note: there's currently no way to ask it to read that history back**; checking what's been done means looking at the list directly in the Google Tasks app
 
 **Not yet built**
-- Proactive reminder delivery (Phase 7)
-- SMS (Phase 4b, blocked on carrier registration)
-- Cloud escalation to Anthropic for complex queries (Phase 8)
-- Chore history read-back (no `list_chores` tool)
+- Reminders don't proactively notify anyone yet — they're saved, but nothing fires when the time comes (Phase 7)
+- Texting the household (SMS) isn't live yet — blocked on carrier registration (Phase 4b)
+- No automatic hand-off to a more powerful cloud model for harder questions yet (Phase 8)
+- No way to ask the assistant what chores have been done recently — only add new entries
 
 ---
 
