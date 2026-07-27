@@ -10,11 +10,24 @@ services:
       # arrive as true loopback inside the container.)
       - "127.0.0.1:8642:8642"
     volumes:
-      # The one and only volume: this is the architecture plan's "/data" —
-      # Hermes's ~/.hermes (config/memory/skills), and later the Google OAuth
-      # token + reminder-scheduler SQLite. No bind mounts of any host
-      # directory (Documents, iCloud Drive, etc.), no docker.sock.
-      - hermes_data:/home/hermes/.hermes
+      # The one and only mount: this is the architecture plan's "/data" —
+      # Hermes's ~/.hermes (config/memory/skills), the Google OAuth token,
+      # conversation/session state, and the reminder-scheduler SQLite.
+      # Bind-mounted to a sibling directory (../conductor-data/hermes), not
+      # a Docker-managed named volume: a named volume lives inside Docker
+      # Desktop's VM (/var/lib/docker/volumes/...), invisible to normal
+      # host backups, and was found to hold real unbacked-up data (session
+      # history, the OAuth token, hand-tuned config) with no copy anywhere
+      # else. Deliberately a *sibling* of this repo, not a subdirectory of
+      # it, even gitignored: `git clean -fdx` would delete a gitignored
+      # subdirectory without hesitation. This is still not the "no bind
+      # mounts of host directories" case the original comment (see git
+      # history) warned against — that was about not exposing the *user's*
+      # personal folders (Documents, iCloud Drive) to the sandboxed agent;
+      # this directory holds only Hermes's own state, identical in content
+      # and exposure to what the named volume held, just relocated so a
+      # human can see and back it up.
+      - ../conductor-data/hermes:/home/hermes/.hermes
     environment:
       # oMLX doesn't require auth, but Hermes's OpenAI-compatible client
       # expects a non-empty key.
@@ -32,6 +45,3 @@ services:
       - net.ipv6.conf.all.disable_ipv6=1
     stdin_open: true
     tty: true
-
-volumes:
-  hermes_data:

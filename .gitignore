@@ -5,3 +5,14 @@ __pycache__/
 .DS_Store
 household/ab_test/results/
 family_members.json
+
+# Hermes's live state (session history, memory, OAuth token, hand-tuned
+# config) lives outside this repo entirely — bind-mounted from
+# ../conductor-data/hermes, see docker-compose.yml. Nothing under that path
+# is ever inside this working tree, so it can't be committed regardless of
+# gitignore. These entries are defense-in-depth only, for the case someone
+# copies one of these files into the repo for local debugging and forgets
+# to remove it — real credentials, never meant to be committed.
+google_token.json
+google_client_secret.json
+auth.json

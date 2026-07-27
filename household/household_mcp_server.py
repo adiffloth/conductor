@@ -57,6 +57,29 @@ SCOPES = [
 GROCERY_LIST_NAME = "Groceries"
 CHORES_LIST_NAME = "Chores"
 
+# Guards against a known local-model failure mode: long-lived Telegram/Photon
+# sessions carry a "Conversation started: <date>" anchor baked into Hermes's
+# cached system prompt (see agent/system_prompt.py upstream), which only gets
+# refreshed on specific rebuild paths (new session, context compression) —
+# NOT on a gateway/container restart, since a continuing session's prompt is
+# restored verbatim from the session DB. A session that spans midnight leaves
+# the model believing "today" is whatever date the session started, so a
+# relative phrase like "today at 3" silently resolves to the wrong day. This
+# checks the model's own output against the real clock and hands back the
+# correct current time so it can self-correct in the same turn, rather than
+# silently writing a past-dated event that the Phase 7 scheduler then fires
+# immediately as "overdue".
+def _reject_if_past(start_dt: datetime) -> str | None:
+    now = datetime.now(timezone.utc)
+    if start_dt > now:
+        return None
+    return (
+        f"'{start_dt.isoformat()}' has already passed — the current date/time "
+        f"is {now.isoformat()}. Re-derive the requested time relative to that, "
+        "not to any date earlier in this conversation, and call this tool "
+        "again with the corrected time."
+    )
+
 # Phase 8: cloud escalation. The local oMLX model (Hermes's primary model,
 # unchanged) handles everything else; only these tools ever leave the
 # household — see project_plan.md Phase 8 for why this is deliberately
@@ -114,6 +137,17 @@ def _with_timezone(value: str) -> str:
     if "T" not in value or value.endswith("Z") or "+" in value[10:] or "-" in value[10:]:
         return value
     return value + "Z"
+
+
+def _normalize_due(value: str) -> str:
+    """Google Tasks' `due` field is RFC 3339, but the API only ever reads
+    back the date portion — any time-of-day given is discarded. Zero-fill
+    a bare date to UTC midnight so the date itself can't shift by a day
+    depending on the caller's timezone offset.
+    """
+    if "T" in value:
+        return _with_timezone(value)
+    return f"{value}T00:00:00Z"
 
 
 def _event_summary(e: dict) -> dict:
@@ -220,6 +254,11 @@ def add_calendar_event(
             household's. A name that isn't registered is reported back in
             the result rather than silently skipped — tell the user.
     """
+    start_dt = datetime.fromisoformat(_with_timezone(start).replace("Z", "+00:00"))
+    past_error = _reject_if_past(start_dt)
+    if past_error:
+        return json.dumps({"status": "error", "error": past_error})
+
     event = {"summary": summary, "start": {"dateTime": start}, "end": {"dateTime": end}}
     if location:
         event["location"] = location
@@ -273,7 +312,11 @@ def set_reminder(summary: str, when: str, channel: str = "telegram") -> str:
             }
         )
 
-    start_dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
+    start_dt = datetime.fromisoformat(_with_timezone(when).replace("Z", "+00:00"))
+    past_error = _reject_if_past(start_dt)
+    if past_error:
+        return json.dumps({"status": "error", "error": past_error})
+
     end_dt = start_dt + timedelta(minutes=5)
     event = {
         "summary": f"Reminder: {summary}",
@@ -457,52 +500,180 @@ def suggest_meeting_time(
 
 
 @mcp.tool()
-def add_grocery_item(item: str) -> str:
-    """Add an item to the household grocery list.
-
-    Args:
-        item: What to add (e.g. "milk", "organic eggs").
+def list_task_lists() -> str:
+    """List the names of every household task list that exists — the
+    grocery list, the chores list, and any ad-hoc list a family member has
+    created (e.g. "Vacation packing"). Use this before adding to a new list
+    by name (add_list_item creates one automatically on first use) to check
+    whether a similarly-named list already exists — avoids ending up with
+    both "Vacation packing" and "Packing for vacation" as separate lists
+    from a small wording difference.
     """
     service = _tasks_service()
-    list_id = _find_or_create_tasklist(service, GROCERY_LIST_NAME)
-    result = service.tasks().insert(tasklist=list_id, body={"title": item}).execute()
-    return json.dumps({"status": "added", "id": result["id"], "item": result.get("title", item)})
+    result = service.tasklists().list(maxResults=100).execute()
+    return json.dumps([tl["title"] for tl in result.get("items", [])], ensure_ascii=False)
 
 
 @mcp.tool()
-def list_groceries() -> str:
-    """List everything currently on the household grocery list (not yet bought)."""
+def add_list_item(item: str, list_name: str = GROCERY_LIST_NAME, due: str = "") -> str:
+    """Add an item to a household task list. Defaults to the grocery list —
+    pass list_name for any other list (e.g. "Chores", "Vacation packing").
+    Adding to the chores list creates a pending to-do — use
+    complete_list_item on it once it's done. Creates the list automatically
+    on first use if it doesn't exist yet; use list_task_lists first if
+    you're unsure whether a similarly-named list already exists.
+
+    Args:
+        item: What to add (e.g. "milk", "organic eggs", "take out the trash").
+        list_name: Which list to add to. Defaults to the grocery list.
+        due: Optional due date (e.g. "2026-07-31"). Google Tasks only
+            tracks the date, not a time of day — for something that should
+            fire a message at a specific time, use set_reminder instead.
+    """
     service = _tasks_service()
-    list_id = _find_or_create_tasklist(service, GROCERY_LIST_NAME)
+    list_id = _find_or_create_tasklist(service, list_name)
+    body = {"title": item}
+    if due:
+        body["due"] = _normalize_due(due)
+    result = service.tasks().insert(tasklist=list_id, body=body).execute()
+    response = {"status": "added", "id": result["id"], "item": result.get("title", item), "list": list_name}
+    if result.get("due"):
+        response["due"] = result["due"]
+    return json.dumps(response)
+
+
+@mcp.tool()
+def set_due_date(item_id: str, due: str, list_name: str = GROCERY_LIST_NAME) -> str:
+    """Set or change the due date on an existing task-list item. Google
+    Tasks only tracks the date, not a time of day — for something that
+    should fire a message at a specific time, use set_reminder instead.
+    Use list_items first to find the item's id.
+
+    Args:
+        item_id: The item's id, from list_items.
+        due: New due date (e.g. "2026-07-31").
+        list_name: Which list the item is on. Defaults to the grocery list.
+    """
+    service = _tasks_service()
+    list_id = _find_or_create_tasklist(service, list_name)
+    result = service.tasks().patch(
+        tasklist=list_id, task=item_id, body={"due": _normalize_due(due)}
+    ).execute()
+    return json.dumps({"status": "updated", "id": item_id, "list": list_name, "due": result.get("due", "")})
+
+
+@mcp.tool()
+def remove_list_item(item_id: str, list_name: str = GROCERY_LIST_NAME) -> str:
+    """Delete an item from a household task list outright, with no record
+    left behind. Use this to clear an item that's no longer wanted (a
+    grocery item you changed your mind about, a chore that turned out not
+    to be needed) — use complete_list_item instead if the item was done
+    and should stay in that list's history (chores in particular, since
+    summarize_past_week reads completed chores, not deleted ones). Use
+    list_items first to find the item's id — matching is by id, not by
+    name, so a duplicate (e.g. "oat milk" listed twice) can be removed
+    once while leaving the other in place. Defaults to the grocery list —
+    pass list_name for any other list.
+
+    Args:
+        item_id: The item's id, from list_items.
+        list_name: Which list to remove from. Defaults to the grocery list.
+    """
+    service = _tasks_service()
+    list_id = _find_or_create_tasklist(service, list_name)
+    service.tasks().delete(tasklist=list_id, task=item_id).execute()
+    return json.dumps({"status": "removed", "id": item_id, "list": list_name})
+
+
+@mcp.tool()
+def complete_list_item(item_id: str, list_name: str = GROCERY_LIST_NAME, notes: str = "") -> str:
+    """Mark an item on a household task list as done, keeping it in that
+    list's history — use this for a pending chore (added via add_list_item)
+    that's now finished, since summarize_past_week reads completed chores
+    for its weekly recap and a deleted item wouldn't show up there. Use
+    remove_list_item instead if the item should just disappear with no
+    record. Use list_items first to find the item's id.
+
+    Args:
+        item_id: The item's id, from list_items.
+        list_name: Which list the item is on. Defaults to the grocery list.
+        notes: Optional note to attach (e.g. "Done by: Sam").
+    """
+    service = _tasks_service()
+    list_id = _find_or_create_tasklist(service, list_name)
+    body = {"status": "completed"}
+    if notes:
+        body["notes"] = notes
+    result = service.tasks().patch(tasklist=list_id, task=item_id, body=body).execute()
+    return json.dumps(
+        {"status": "completed", "id": item_id, "list": list_name, "item": result.get("title", "")}
+    )
+
+
+@mcp.tool()
+def list_items(list_name: str = GROCERY_LIST_NAME) -> str:
+    """List everything currently on a household task list (not yet
+    completed/bought). Defaults to the grocery list — pass list_name for
+    any other list. Use list_task_lists first if you're unsure a list by
+    this name exists.
+
+    Args:
+        list_name: Which list to read. Defaults to the grocery list.
+    """
+    service = _tasks_service()
+    list_id = _find_or_create_tasklist(service, list_name)
     result = service.tasks().list(tasklist=list_id, showCompleted=False).execute()
-    items = [{"id": t["id"], "item": t.get("title", "")} for t in result.get("items", [])]
+    items = []
+    for t in result.get("items", []):
+        entry = {"id": t["id"], "item": t.get("title", "")}
+        if t.get("due"):
+            entry["due"] = t["due"]
+        items.append(entry)
     return json.dumps(items, ensure_ascii=False)
 
 
 @mcp.tool()
-def log_chore(chore: str, person: str = "") -> str:
-    """Record that a household chore was completed. Use this *after* a chore
-    is done, to log it — not to schedule or assign an upcoming one.
+def create_task_list(list_name: str) -> str:
+    """Create a new, empty household task list by name (e.g. "Home
+    Projects"). Not required before add_list_item, which creates a list
+    automatically on first use — use this only when the user wants an
+    empty list started ahead of any items being added to it. Idempotent by
+    name: if a list with this exact title already exists, returns it
+    rather than creating a duplicate (Google Tasks does not enforce unique
+    titles, so a second insert with the same title would otherwise silently
+    create a second, separate list). Use list_task_lists first if you're
+    unsure whether a similarly-worded list already exists.
 
     Args:
-        chore: What was done (e.g. "took out the trash", "vacuumed living room").
-        person: Optional — who did it.
+        list_name: The new list's title (e.g. "Home Projects").
     """
     service = _tasks_service()
-    list_id = _find_or_create_tasklist(service, CHORES_LIST_NAME)
-    body = {"title": chore, "status": "completed"}
-    if person:
-        body["notes"] = f"Done by: {person}"
-    result = service.tasks().insert(tasklist=list_id, body=body).execute()
-    return json.dumps(
-        {
-            "status": "logged",
-            "id": result["id"],
-            "chore": result.get("title", chore),
-            "person": person,
-            "completed": result.get("status") == "completed",
-        }
-    )
+    result = service.tasklists().list(maxResults=100).execute()
+    for tl in result.get("items", []):
+        if tl["title"] == list_name:
+            return json.dumps({"status": "already exists", "id": tl["id"], "list": list_name})
+    created = service.tasklists().insert(body={"title": list_name}).execute()
+    return json.dumps({"status": "created", "id": created["id"], "list": list_name})
+
+
+@mcp.tool()
+def delete_task_list(list_name: str) -> str:
+    """Delete an entire household task list, including every item on it.
+    This is permanent and cannot be undone — confirm with the user before
+    calling it. Not the same as remove_list_item, which deletes one item
+    while leaving the list itself in place. Use list_task_lists first to
+    confirm the exact name.
+
+    Args:
+        list_name: The list's exact title, from list_task_lists.
+    """
+    service = _tasks_service()
+    result = service.tasklists().list(maxResults=100).execute()
+    for tl in result.get("items", []):
+        if tl["title"] == list_name:
+            service.tasklists().delete(tasklist=tl["id"]).execute()
+            return json.dumps({"status": "deleted", "list": list_name})
+    return json.dumps({"status": "error", "error": f"No task list named '{list_name}' found."})
 
 
 def _get_openai_cloud_api_key() -> str:
@@ -587,7 +758,7 @@ def plan_upcoming_week() -> str:
     model regardless of how routine the request sounds.
     """
     agenda = get_agenda()
-    groceries = list_groceries()
+    groceries = list_items(GROCERY_LIST_NAME)
     prompt = (
         "You are helping a household plan the coming week. Given the "
         "calendar agenda and grocery list below, write a short, practical "

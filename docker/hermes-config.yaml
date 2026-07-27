@@ -1,13 +1,144 @@
-# Phase 2: local-model-only config. No channels, no skills, no cloud fallback yet.
-# oMLX runs bare-metal on the host; host.docker.internal is Docker Desktop for Mac's
-# built-in DNS name for reaching it from inside this container.
+# Kept in sync with the running container's live ~/.hermes/config.yaml —
+# this file only reaches a *fresh* mount (a plain image rebuild doesn't
+# touch an existing one, since /home/hermes/.hermes is mounted over it; see
+# docker-compose.yml). Previously frozen at its Phase 2 (local-model-only)
+# state while the live config evolved all the way through Phase 8b —
+# rediscovered as real config drift risk and resynced. From here on, edit
+# *this* file and redeploy to the container, not the other way around, or
+# the drift just regrows. See project_plan.md for the phase-by-phase history
+# behind each section below.
 model:
   provider: custom
-  model: Qwen3.6-35B-A3B-MLX-6bit
   base_url: http://host.docker.internal:8000/v1
-
-# 'local' here means local *to the container* — this is the already-jailed
-# filesystem (no host bind mounts, no docker.sock), so Hermes's own terminal
-# backend does not need to add a second sandbox layer on top.
+  default: Qwen3.6-35B-A3B-MLX-6bit
 terminal:
   backend: local
+_config_version: 33
+plugins:
+  enabled:
+    - household-identity
+    - household-live-time
+    - photon-platform
+  # These bundled backend plugins (browser/image_gen/video_gen/web-search
+  # providers) auto-load unconditionally otherwise -- "Built-in backends
+  # auto-load — they ship with hermes and must just work" per
+  # hermes_cli/plugins.py -- even though none of their tools (browser,
+  # image_gen, video_gen, web_search) are in platform_toolsets below, so
+  # this household assistant never calls them. Disabling by name is the
+  # only way to skip their per-turn import/registration cost; explicit
+  # disable is checked before the auto-load branch, so it works even for
+  # backend-kind plugins that ignore `enabled`.
+  disabled:
+    - browser-browser-use
+    - browser-browserbase
+    - browser-firecrawl
+    - deepinfra
+    - fal
+    - krea
+    - openai
+    - openai-codex
+    - openrouter
+    - xai
+    - web-brave-free
+    - web-ddgs
+    - web-exa
+    - web-firecrawl
+    - web-parallel
+    - web-searxng
+    - web-tavily
+    - web-xai
+  entries:
+    household-identity:
+      allow_tool_override: false
+# Suppresses the "Gateway shutting down"/"Gateway online" lifecycle pings
+# Photon would otherwise deliver as real iMessages on every restart — this
+# is a dev container restarted often, and that outbound send round-trips
+# through Photon's cloud relay (the same slow leg measured at 8.9-14.1s in
+# the Phase 9 latency investigation), which is most of why a shutdown took
+# ~20s. gateway_restart_notification defaults to true; per-platform under
+# `platforms`, not `platform_toolsets` below (that key is tool visibility,
+# unrelated).
+platforms:
+  photon:
+    gateway_restart_notification: false
+platform_toolsets:
+  cli:
+    - clarify
+    - code_execution
+    - file
+    - kanban
+    - memory
+    - terminal
+    - todo
+  telegram:
+    - clarify
+    - code_execution
+    - file
+    - kanban
+    - memory
+    - terminal
+    - todo
+  api_server:
+    - code_execution
+    - file
+    - memory
+    - terminal
+    - todo
+  photon:
+    - clarify
+    - code_execution
+    - file
+    - memory
+    - terminal
+    - todo
+known_plugin_toolsets:
+  cli:
+    - spotify
+  telegram:
+    - spotify
+  api_server:
+    - spotify
+mcp_servers:
+  household:
+    command: /home/hermes/.hermes/hermes-agent/venv/bin/python3.11
+    args:
+      - /home/hermes/household/household_mcp_server.py
+    enabled: true
+
+# ── Security ──────────────────────────────────────────────────────────
+# Secret redaction is ON by default — strings that look like API keys,
+# tokens, and passwords are masked in tool output, logs, and chat
+# responses before the model or user ever sees them. Set redact_secrets
+# to false to disable (e.g. when developing the redactor itself).
+# tirith pre-exec scanning is enabled by default when the tirith binary
+# is available. Configure via security.tirith_* keys or env vars
+# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
+#
+# security:
+#   redact_secrets: true
+#   tirith_enabled: true
+#   tirith_path: "tirith"
+#   tirith_timeout: 5
+#   tirith_fail_open: true
+
+# ── Fallback Model ────────────────────────────────────────────────────
+# Automatic provider failover when primary is unavailable.
+# Uncomment and configure to enable. Triggers on rate limits (429),
+# overload (529), service errors (503), or connection failures.
+#
+# Supported providers:
+#   openrouter   (OPENROUTER_API_KEY)  — routes to any model
+#   openai-codex (OAuth — hermes auth) — OpenAI Codex
+#   nous         (OAuth — hermes auth) — Nous Portal
+#   zai          (ZAI_API_KEY)         — Z.AI / GLM
+#   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
+#   kimi-coding-cn (KIMI_CN_API_KEY)   — Kimi / Moonshot (China)
+#   minimax      (MINIMAX_API_KEY)     — MiniMax
+#   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
+#   bedrock      (AWS IAM / boto3)     — AWS Bedrock (Converse API)
+#
+# For custom OpenAI-compatible endpoints, add base_url and key_env.
+#
+# fallback_model:
+#   provider: openrouter
+#   model: anthropic/claude-sonnet-4

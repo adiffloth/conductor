@@ -1,0 +1,6 @@
+name: household-live-time
+version: 1.0.0
+description: "Injects the real current date/time into every turn's ephemeral user-message context via the pre_llm_call hook, working around hermes-agent's cached per-session date anchor going stale once a session spans midnight (NousResearch/hermes-agent#10421, still open upstream as of this project's v0.19.0 install) — fixes relative-date phrases like 'today', 'tomorrow', 'in 5 days' silently resolving to the wrong day. See household_mcp_server.py's _reject_if_past for the complementary guard this doesn't replace."
+author: "conductor (this repo)"
+hooks:
+  - pre_llm_call
