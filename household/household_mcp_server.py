@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
-"""Household MCP server for Hermes Agent — Calendar + Tasks.
+"""Household MCP server for Hermes Agent — Calendar + Tasks + Email.
 
-Exposes calendar and grocery/chore-list read/write tools directly, calling
-the Google Calendar and Tasks APIs in-process. Deliberately bypasses the
-bundled google-workspace skill's skill_view + shelled-out-script path: that
-route requires an extra LLM round trip to load instructions before the
+Exposes calendar, task-list, and email read/write tools directly, calling
+the Google Calendar, Tasks, and Gmail APIs in-process. Deliberately bypasses
+the bundled google-workspace skill's skill_view + shelled-out-script path:
+that route requires an extra LLM round trip to load instructions before the
 agent can even attempt a call, and its scripts assume a generic `python`
 on PATH with dependencies pre-installed, neither of which holds in this
 container (see project_plan.md Phase 6 for the failure this replaces).
-Google Tasks isn't covered by that bundled skill at all regardless.
+Neither Tasks nor Gmail is covered by that bundled skill at all regardless.
 
 Reuses the OAuth token already established via the google-workspace skill's
-setup flow (~/.hermes/google_token.json), scoped to Calendar + Tasks.
+setup flow (~/.hermes/google_token.json), scoped to Calendar + Tasks + Gmail
+(gmail.modify — added for email support; required revoking and re-running
+consent with the expanded scope list, same one-time dance as when Tasks was
+added — Google doesn't add scopes to a live token).
+
+Considered and did not adopt Hermes's own bundled `email-platform` gateway
+plugin for this: it always runs the full agent loop on inbound mail and
+replies via email automatically on the same channel, with no lower-level
+"just notify a different channel" mode — the household wants incoming mail
+to surface as a Telegram notification the user acts on, not an autonomous
+email auto-reply. It's also IMAP/SMTP + app-password based, a second
+credential type this project doesn't need on top of the OAuth token above.
 
 Google has since shipped its own official, remote Calendar MCP server
 (calendarmcp.googleapis.com, GA'd May 2026) with a broader tool set than
@@ -28,6 +39,7 @@ write to — see that section for why.
 """
 import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -49,9 +61,14 @@ except ImportError:
 HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 FAMILY_MEMBERS_PATH = HERMES_HOME / "family_members.json"
+EMAIL_WATCH_RULES_PATH = HERMES_HOME / "email_watch_rules.json"
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/tasks",
+    # modify (not full mail.google.com): read, send, and label/mark-as-read,
+    # but no permanent delete — least privilege that still covers
+    # search_emails/read_email/send_email/reply_to_email below.
+    "https://www.googleapis.com/auth/gmail.modify",
 ]
 
 GROCERY_LIST_NAME = "Groceries"
@@ -88,6 +105,13 @@ def _reject_if_past(start_dt: datetime) -> str | None:
 # and this project's usage is low-volume enough to stay well inside it.
 CLOUD_MODEL = "gpt-5.4"
 
+# household/email_notifier.py's cloud calls (topic-rule classification,
+# daily-digest summarization) can fire every poll tick (every 5 minutes)
+# rather than only on an occasional explicit "research this"/"plan my
+# week" — and both tasks are comparatively easy. Kept off CLOUD_MODEL so
+# that per-tick cost doesn't scale with the full-model price.
+CLOUD_MODEL_MINI = "gpt-5.4-mini"
+
 # Marker in the event description that the Phase 7 reminder scheduler polls
 # for — distinguishes Hermes-created reminders from regular calendar events.
 REMINDER_TAG = "[Hermes Reminder]"
@@ -120,6 +144,12 @@ def _tasks_service():
     from googleapiclient.discovery import build
 
     return build("tasks", "v1", credentials=_get_credentials())
+
+
+def _gmail_service():
+    from googleapiclient.discovery import build
+
+    return build("gmail", "v1", credentials=_get_credentials())
 
 
 def _find_or_create_tasklist(service, title: str) -> str:
@@ -676,6 +706,281 @@ def delete_task_list(list_name: str) -> str:
     return json.dumps({"status": "error", "error": f"No task list named '{list_name}' found."})
 
 
+def _headers_dict(payload: dict) -> dict:
+    """Case-insensitive email header lookup, keyed by lowercased name.
+
+    Header field names are case-insensitive per RFC 5322, but Gmail's API
+    returns (and filters `metadataHeaders` on) whatever exact case the
+    sending system used — confirmed via a live test that Gmail's own
+    auto-generated header on a message sent through this same API is
+    "Message-Id", not the more common "Message-ID" other senders use.
+    Building the lookup dict lowercased means callers never have to guess
+    which casing a given message happens to carry.
+    """
+    return {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+
+
+def _extract_email_body(payload: dict) -> str:
+    """Walk a Gmail message payload for the best available plain-text body.
+
+    Gmail's payload is a tree (multipart/alternative, multipart/mixed with
+    attachments, etc.), not a flat structure — prefers text/plain, falls
+    back to text/html, and recurses into nested parts (a multipart/mixed
+    wrapping a multipart/alternative is common with attachments present).
+    """
+    import base64
+
+    def decode(data: str) -> str:
+        return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode(
+            "utf-8", errors="replace"
+        )
+
+    if payload.get("mimeType") == "text/plain" and payload.get("body", {}).get("data"):
+        return decode(payload["body"]["data"])
+    for part in payload.get("parts", []) or []:
+        if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+            return decode(part["body"]["data"])
+    for part in payload.get("parts", []) or []:
+        if part.get("mimeType") == "text/html" and part.get("body", {}).get("data"):
+            return decode(part["body"]["data"])
+        if part.get("parts"):
+            nested = _extract_email_body(part)
+            if nested:
+                return nested
+    if payload.get("body", {}).get("data"):
+        return decode(payload["body"]["data"])
+    return ""
+
+
+@mcp.tool()
+def search_emails(query: str = "", max_results: int = 20) -> str:
+    """Search the household's email inbox. Uses Gmail's own search syntax
+    (e.g. "from:sam@example.com", "subject:invoice", "is:unread") — the
+    same query language as Gmail's search box. Empty query returns the
+    most recent inbox mail.
+
+    Args:
+        query: Gmail search query. Defaults to recent inbox mail.
+        max_results: Maximum number of messages to return.
+    """
+    service = _gmail_service()
+    result = (
+        service.users()
+        .messages()
+        .list(userId="me", q=query or "in:inbox", maxResults=max_results)
+        .execute()
+    )
+    messages = []
+    for m in result.get("messages", []):
+        msg = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=m["id"],
+                format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            )
+            .execute()
+        )
+        headers = _headers_dict(msg.get("payload", {}))
+        messages.append(
+            {
+                "id": msg["id"],
+                "from": headers.get("from", ""),
+                "subject": headers.get("subject", "(no subject)"),
+                "date": headers.get("date", ""),
+                "snippet": msg.get("snippet", ""),
+            }
+        )
+    return json.dumps(messages, ensure_ascii=False)
+
+
+@mcp.tool()
+def read_email(message_id: str) -> str:
+    """Read the full content of an email. Use search_emails first to find
+    the message_id.
+
+    Args:
+        message_id: The email's id, from search_emails.
+    """
+    service = _gmail_service()
+    msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    headers = _headers_dict(msg.get("payload", {}))
+    return json.dumps(
+        {
+            "id": msg["id"],
+            "thread_id": msg.get("threadId", ""),
+            "from": headers.get("from", ""),
+            "to": headers.get("to", ""),
+            "subject": headers.get("subject", "(no subject)"),
+            "date": headers.get("date", ""),
+            "body": _extract_email_body(msg.get("payload", {})),
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+def send_email(to: str, subject: str, body: str) -> str:
+    """Send a new email from the household's email address. For replying to
+    an email the household received, use reply_to_email instead — it keeps
+    the reply in the same thread the recipient's mail client shows, rather
+    than starting a new, unrelated-looking conversation.
+
+    Args:
+        to: Recipient email address.
+        subject: Email subject line.
+        body: Plain-text email body.
+    """
+    import base64
+    from email.message import EmailMessage
+
+    # EmailMessage (not the legacy MIMEText), and header names capitalized
+    # exactly ("To"/"Subject", not "to"/"subject") — confirmed via a live
+    # test that Gmail stores whatever header-name case it's sent, and
+    # search_emails'/reply_to_email's metadataHeaders lookups are
+    # case-sensitive, so a lowercase header is invisible to them even
+    # though the message sends fine and looks normal in a mail client.
+    # EmailMessage.set_content also handles a non-ASCII body correctly
+    # (UTF-8), which plain MIMEText(body) does not.
+    message = EmailMessage()
+    message["To"] = to
+    message["Subject"] = subject
+    message.set_content(body)
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+    service = _gmail_service()
+    result = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+    return json.dumps({"status": "sent", "id": result["id"], "to": to, "subject": subject})
+
+
+@mcp.tool()
+def reply_to_email(message_id: str, body: str) -> str:
+    """Reply to a specific email, staying in the same thread — the
+    recipient's mail client shows it as a threaded reply, not a new,
+    unrelated-looking message. Use search_emails/read_email first to find
+    the message_id.
+
+    Args:
+        message_id: The id of the email being replied to, from
+            search_emails/read_email.
+        body: Plain-text reply body.
+    """
+    import base64
+    from email.message import EmailMessage
+
+    service = _gmail_service()
+    # format="full" rather than metadata+metadataHeaders — that filter is
+    # case-sensitive on the exact header name, and Message-ID's casing
+    # varies by sending system (Gmail's own auto-generated header on a
+    # message sent through this same API is "Message-Id", confirmed live;
+    # other senders commonly use "Message-ID"). Fetching everything and
+    # looking up case-insensitively (_headers_dict) sidesteps having to
+    # guess which casing any given message happens to carry.
+    original = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    headers = _headers_dict(original.get("payload", {}))
+    original_msg_id = headers.get("message-id", "")
+    subject = headers.get("subject", "")
+    if not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}"
+    to_addr = headers.get("from", "")
+
+    # EmailMessage + capitalized header names — see send_email's comment
+    # for why (Gmail's metadataHeaders lookups are case-sensitive on
+    # whatever case the sending code used).
+    message = EmailMessage()
+    message["To"] = to_addr
+    message["Subject"] = subject
+    if original_msg_id:
+        message["In-Reply-To"] = original_msg_id
+        message["References"] = f"{headers.get('references', '')} {original_msg_id}".strip()
+    message.set_content(body)
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+    result = (
+        service.users()
+        .messages()
+        .send(userId="me", body={"raw": raw, "threadId": original.get("threadId", "")})
+        .execute()
+    )
+    return json.dumps({"status": "sent", "id": result["id"], "to": to_addr, "subject": subject})
+
+
+EMAIL_WATCH_KINDS = {"sender", "topic"}
+
+
+def _load_email_watch_rules() -> list[dict]:
+    if not EMAIL_WATCH_RULES_PATH.exists():
+        return []
+    return json.loads(EMAIL_WATCH_RULES_PATH.read_text()).get("rules", [])
+
+
+def _save_email_watch_rules(rules: list[dict]) -> None:
+    EMAIL_WATCH_RULES_PATH.write_text(
+        json.dumps({"rules": rules}, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+@mcp.tool()
+def add_email_watch_rule(kind: str, value: str) -> str:
+    """Set up a rule to get notified in Telegram right away when a matching
+    email arrives — for anything more time-sensitive than the daily email
+    digest, which covers everything else regardless of these rules.
+
+    Args:
+        kind: "sender" to notify on mail from a specific person — value can
+            be a registered family member's name (resolved the same way as
+            add_calendar_event's attendees) or a raw email address.
+            "topic" to notify on mail about a specific subject — value is a
+            free-text description (e.g. "the item I have for sale on
+            marketplace").
+        value: The sender name/address, or the topic description.
+    """
+    if kind not in EMAIL_WATCH_KINDS:
+        return json.dumps(
+            {"status": "error", "error": f"kind must be one of {sorted(EMAIL_WATCH_KINDS)}"}
+        )
+
+    entry = {"id": uuid.uuid4().hex[:8], "kind": kind}
+    if kind == "sender":
+        emails, unresolved = _resolve_emails([value])
+        entry["sender_email"] = emails[0] if emails else value
+        if unresolved:
+            entry["note"] = (
+                f"'{value}' isn't a registered family member — treating it as a raw email address."
+            )
+    else:
+        entry["topic"] = value
+
+    rules = _load_email_watch_rules()
+    rules.append(entry)
+    _save_email_watch_rules(rules)
+    return json.dumps({"status": "added", **entry}, ensure_ascii=False)
+
+
+@mcp.tool()
+def list_email_watch_rules() -> str:
+    """List every active email watch rule (set via add_email_watch_rule)."""
+    return json.dumps(_load_email_watch_rules(), ensure_ascii=False)
+
+
+@mcp.tool()
+def remove_email_watch_rule(rule_id: str) -> str:
+    """Remove an email watch rule. Use list_email_watch_rules first to find
+    the rule's id.
+
+    Args:
+        rule_id: The rule's id, from list_email_watch_rules.
+    """
+    rules = _load_email_watch_rules()
+    remaining = [r for r in rules if r.get("id") != rule_id]
+    if len(remaining) == len(rules):
+        return json.dumps({"status": "error", "error": f"No watch rule with id '{rule_id}' found."})
+    _save_email_watch_rules(remaining)
+    return json.dumps({"status": "removed", "id": rule_id})
+
+
 def _get_openai_cloud_api_key() -> str:
     """Read the cloud-escalation API key. Checks the environment first, but
     falls back to reading ~/.hermes/.env directly — relying on this MCP
@@ -695,7 +1000,9 @@ def _get_openai_cloud_api_key() -> str:
     raise RuntimeError("OPENAI_CLOUD_API_KEY not found in environment or ~/.hermes/.env")
 
 
-def _call_cloud(prompt: str, *, tools: list | None = None, effort: str = "high") -> str:
+def _call_cloud(
+    prompt: str, *, tools: list | None = None, effort: str = "high", model: str = CLOUD_MODEL
+) -> str:
     """Call the cloud model directly for a request explicitly routed to the
     cloud tier (see project_plan.md Phase 8) — the local oMLX model never
     sees this prompt or its answer. Returns the response text, or a JSON
@@ -706,6 +1013,10 @@ def _call_cloud(prompt: str, *, tools: list | None = None, effort: str = "high")
     with the web_search tool (multiple search rounds, each adding more
     reasoning) can take 5+ minutes and blow past Hermes's MCP tool-call
     timeout; research_topic passes "medium" to stay responsive.
+
+    model defaults to CLOUD_MODEL; email_notifier.py passes CLOUD_MODEL_MINI
+    explicitly for its higher-frequency, lower-difficulty calls — the three
+    tools below that don't pass it are unaffected.
     """
     import openai
 
@@ -715,7 +1026,7 @@ def _call_cloud(prompt: str, *, tools: list | None = None, effort: str = "high")
     # OPENAI_CLOUD_API_KEY for how this was found.
     client = openai.OpenAI(api_key=_get_openai_cloud_api_key())
     kwargs = dict(
-        model=CLOUD_MODEL,
+        model=model,
         input=prompt,
         reasoning={"effort": effort},
     )

@@ -19,11 +19,26 @@ Photon delivery needs PHOTON_SIDECAR_TOKEN pinned in ~/.hermes/.env (see
 that file's comment) — a cron-spawned process like this one never talks to
 the live gateway, so it can't discover a randomly-generated token the way
 a real conversation turn would.
+
+Delivery timing: this only *starts* once per POLL_INTERVAL_MINUTES (the
+cron job's "every 5m" schedule, jobs.json), but doesn't just fire whatever
+happens to already be due at that instant — the query looks ahead by a
+full interval, and anything found still in the future gets a precise
+time.sleep() before delivery rather than going out immediately. Without
+this, a reminder set for 2:45 was landing anywhere up to ~5 minutes late
+(2:49 observed) depending on where 2:45 fell relative to the poll tick,
+not because delivery itself was slow. A run that sleeps close to the full
+interval can overlap the next scheduled tick; the cron scheduler already
+skips a tick that fires while the previous one is still running rather
+than running both at once, and nothing is lost by that — the skipped
+tick's window is still covered by the *next* tick's own lookahead, since
+there's no lower bound on how overdue a not-yet-sent reminder can be.
 """
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -37,6 +52,11 @@ DELIVER_TARGETS = {
     "photon": "photon",
 }
 DEFAULT_CHANNEL = "telegram"
+
+# Must match (or exceed) the cron job's own schedule interval (jobs.json:
+# "every 5m") — the query window below has to be at least this wide, or a
+# reminder due between two ticks could be missed by both.
+POLL_INTERVAL_MINUTES = 5
 
 
 def _load_photon_sidecar_token() -> str | None:
@@ -53,14 +73,26 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def _due_reminders(service) -> list[dict]:
-    now = datetime.now(timezone.utc).isoformat()
+def _due_or_upcoming_reminders(service) -> list[dict]:
+    """Not-yet-sent reminders due now, or due within the next poll interval.
+
+    timeMax looks a full POLL_INTERVAL_MINUTES ahead rather than just up to
+    now — main() sleeps off the remainder for anything still in the future
+    so delivery lands on the requested minute instead of at the mercy of
+    where "now" happened to fall relative to the poll tick. No lower bound
+    on how overdue something can be (hermesReminderSent=false already
+    excludes delivered ones), so a reminder that fell in a skipped tick's
+    window is still picked up here, just later than intended rather than
+    lost.
+    """
+    now = datetime.now(timezone.utc)
+    time_max = (now + timedelta(minutes=POLL_INTERVAL_MINUTES)).isoformat()
     result = (
         service.events()
         .list(
             calendarId="primary",
             privateExtendedProperty=["hermesReminder=true", "hermesReminderSent=false"],
-            timeMax=now,
+            timeMax=time_max,
             singleEvents=True,
             orderBy="startTime",
         )
@@ -101,12 +133,20 @@ def _deliver(text: str, channel: str) -> bool:
 
 def main() -> None:
     service = _calendar_service()
-    due = _due_reminders(service)
+    due = _due_or_upcoming_reminders(service)
     if not due:
         _log("no due reminders")
         return
 
     for event in due:
+        start_str = event.get("start", {}).get("dateTime", "")
+        if start_str:
+            start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+            wait_seconds = (start_dt - datetime.now(timezone.utc)).total_seconds()
+            if wait_seconds > 0:
+                _log(f"sleeping {wait_seconds:.0f}s so event {event['id']} delivers at {start_str}")
+                time.sleep(wait_seconds)
+
         summary = event.get("summary", "Reminder")
         channel = event.get("extendedProperties", {}).get("private", {}).get(
             "hermesReminderChannel", DEFAULT_CHANNEL

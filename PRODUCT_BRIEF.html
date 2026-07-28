@@ -373,7 +373,7 @@
     <div class="meta-row">
       <span><b>Reachable via</b> Telegram · iMessage · phone call</span>
       <span><b>Runs on</b> a Mac at home</span>
-      <span><b>Household data</b> Google Calendar &amp; Tasks</span>
+      <span><b>Household data</b> Google Calendar, Tasks &amp; Email</span>
     </div>
   </header>
 
@@ -399,8 +399,13 @@
       </div>
       <div class="cap">
         <h3>Shared lists</h3>
-        <p>Groceries and chores, added and checked from any channel, backed by the same Google Tasks lists everyone can already open on their phone.</p>
+        <p>Groceries, chores, or any list you make up on the spot, added and checked from any channel, backed by the same Google Tasks lists everyone can already open on their phone.</p>
         <span class="ex">add oat milk and paper towels</span>
+      </div>
+      <div class="cap">
+        <h3>Email, without the noise</h3>
+        <p>Reads, sends, and replies to real email on request — but doesn't announce every message. Tell it what actually deserves an interruption; everything else waits for one daily digest.</p>
+        <span class="ex">let me know right away if Sam emails</span>
       </div>
       <div class="cap">
         <h3>Reach it however's easiest</h3>
@@ -454,6 +459,13 @@
           <p class="result">One of the fixed tasks that always escalates — the reply is grounded in the real calendar and grocery list, not generic advice, and comes back from the more capable model automatically.</p>
         </div>
       </div>
+      <div class="case">
+        <span class="channel">Telegram</span>
+        <div class="story">
+          <p>Once, in passing: <em>"if I get an email about the item I have for sale on Marketplace, tell me right away."</em></p>
+          <p class="result">Every other email waits for tomorrow's digest; that one gets a Telegram message the moment it lands, unprompted, from then on.</p>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -469,10 +481,10 @@ flowchart LR
     FAMILY["Family members"] -->|"Telegram, iMessage, or a phone call"| CONDUCTOR["Conductor\nruns at home, sandboxed"]
     CONDUCTOR --> LOCAL["Local model\nhandles routine requests"]
     CONDUCTOR -.->|"a fixed task, or an explicit ask to research"| CLOUD["Cloud model\nharder reasoning, live search"]
-    CONDUCTOR <--> GOOGLE["Household calendar &amp; lists\nsame data, every channel"]
+    CONDUCTOR <--> GOOGLE["Household calendar, lists &amp; email\nsame data, every channel"]
 </pre>
     </div>
-    <p class="arch-note">The local model is the default for everything — it never leaves the house and there's no per-question cost. A short, deliberately chosen set of tasks always escalate to a more capable cloud model instead of guessing at "how hard" a question is; the household's own calendar and lists live in Google, so the same state shows up whether it was set by voice, text, or directly in the Calendar app.</p>
+    <p class="arch-note">The local model is the default for everything — it never leaves the house and there's no per-question cost. A short, deliberately chosen set of tasks always escalate to a more capable cloud model instead of guessing at "how hard" a question is; the household's own calendar, lists, and email live in Google, so the same state shows up whether it was set by voice, text, or directly in the Calendar/Tasks/Gmail apps.</p>
   </section>
 
   <section id="principles">

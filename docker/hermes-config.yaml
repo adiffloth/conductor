@@ -1,12 +1,3 @@
-# Kept in sync with the running container's live ~/.hermes/config.yaml —
-# this file only reaches a *fresh* mount (a plain image rebuild doesn't
-# touch an existing one, since /home/hermes/.hermes is mounted over it; see
-# docker-compose.yml). Previously frozen at its Phase 2 (local-model-only)
-# state while the live config evolved all the way through Phase 8b —
-# rediscovered as real config drift risk and resynced. From here on, edit
-# *this* file and redeploy to the container, not the other way around, or
-# the drift just regrows. See project_plan.md for the phase-by-phase history
-# behind each section below.
 model:
   provider: custom
   base_url: http://host.docker.internal:8000/v1
@@ -61,6 +52,14 @@ plugins:
 platforms:
   photon:
     gateway_restart_notification: false
+  # Default ("first") threads/quote-replies the first chunk of the final
+  # response to the triggering message. Mid-turn interim commentary (sent
+  # before a tool call resolves, e.g. "let me save that...") never carries
+  # a reply-to candidate regardless of this setting, so a turn that needed
+  # a tool call was showing one quoted message plus one unquoted one —
+  # inconsistent, and quoting at all wasn't wanted either way.
+  telegram:
+    reply_to_mode: "off"
 platform_toolsets:
   cli:
     - clarify

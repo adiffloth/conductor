@@ -14,9 +14,9 @@ assistant can actually do and how to demo it.
 A household AI assistant ("Hermes") reachable over Telegram, iMessage, and
 phone calls, running mostly on a local LLM on this Mac Studio (via oMLX),
 with a small amount of custom code (this repo) giving it Google
-Calendar/Tasks access. Everything Hermes-related runs inside one Docker
-container; oMLX runs bare-metal on the host; a couple of things (ngrok,
-oMLX itself) run on the host outside Docker.
+Calendar/Tasks/Email access. Everything Hermes-related runs inside one
+Docker container; oMLX runs bare-metal on the host; a couple of things
+(ngrok, oMLX itself) run on the host outside Docker.
 
 ---
 
@@ -34,11 +34,13 @@ oMLX itself) run on the host outside Docker.
 | `Dockerfile`, `docker-compose.yml` | The sandbox container definition |
 | `.env` | **All secrets. Not committed (gitignored). Lives only on this machine.** Synced into the container manually (see below) — Docker Compose doesn't read it directly |
 | `.gitignore` | Also excludes `.venv/`, `__pycache__/`, `.DS_Store`, `*.pyc` |
-| `docker/hermes-config.yaml` | Hermes's runtime config, baked into the image at build time (model provider, terminal backend) |
+| `docker/hermes-config.yaml` | The versioned source of truth for `~/.hermes/config.yaml` — model provider, `terminal.backend`, `plugins`, `platform_toolsets`, `mcp_servers`, per-platform settings. Only reaches a *fresh* mount automatically (see below); edit here and redeploy, don't edit the live one directly |
 | `docker/sync-env.py` | Utility script: merges `.env`'s keys into the container's `~/.hermes/.env` without ever putting a secret on a host command line |
-| `household/household_mcp_server.py` | **The core custom code.** An MCP server exposing Calendar (7 tools), Tasks/grocery/chore (3 tools), multi-user scheduling (`list_family_members` — Phase 8b), and cloud escalation (3 tools: `research_topic`, `plan_upcoming_week`, `summarize_past_week` — Phase 8) directly to Hermes — 14 tools total, no shell-outs, no generic skill-discovery indirection |
-| `household/reminder_scheduler.py` | Phase 7: polls Calendar for due reminders, delivers via `hermes send` (Telegram or iMessage, per-reminder choice), marks them sent |
+| `household/household_mcp_server.py` | **The core custom code.** An MCP server exposing Calendar (7 tools), task lists — generic across groceries/chores/any ad-hoc list, not grocery-specific (8 tools), Email (7 tools: `search_emails`, `read_email`, `send_email`, `reply_to_email`, `add_email_watch_rule`, `list_email_watch_rules`, `remove_email_watch_rule` — Phase 11), multi-user scheduling (`list_family_members` — Phase 8b), and cloud escalation (3 tools: `research_topic`, `plan_upcoming_week`, `summarize_past_week` — Phase 8) directly to Hermes — 30 tools total, no shell-outs, no generic skill-discovery indirection |
+| `household/reminder_scheduler.py` | Phase 7: polls Calendar for due reminders, sleeps to the exact requested second (not just "within the poll interval" — Phase 7 update), delivers via `hermes send` (Telegram or iMessage, per-reminder choice), marks them sent |
 | `household/cron_entrypoint.py` | A required 3-line wrapper — `hermes cron` only accepts real files directly under `~/.hermes/scripts/`, not symlinks elsewhere. This gets copied there once; the real logic stays in `reminder_scheduler.py` |
+| `household/email_notifier.py` | Phase 11: a second `hermes cron` job (`every 5m`) — checks new mail against user-defined watch rules (sender-based, or topic-based via a cloud-model classification call) and pushes a Telegram notification on a match; separately, once a day, summarizes the previous day's mail into a digest. Reuses `reminder_scheduler.py`'s delivery helpers rather than re-implementing them |
+| `household/cron_entrypoint_email.py` | Same wrapper pattern as `cron_entrypoint.py`, pointed at `email_notifier.py` |
 | `household/seed_demo_data.py` | Populates realistic calendar events / grocery items / chore-log entries, relative to "today". Re-run before a demo to refresh dates |
 | `household/ab_test/conversation.json` | Fixed 7-turn script for the local-vs-cloud A/B test (Phase 8 side quest) |
 | `household/ab_test/run_ab_test.py` | Replays the script against the live API Server, records per-turn latency + transcript to `household/ab_test/results/<label>.json` |
@@ -47,17 +49,23 @@ oMLX itself) run on the host outside Docker.
 | `family_members.json` | Multi-user scheduling registry (name → email, + optional telegram_id/phone). Not committed — PII, same treatment as `.env`. See "Add a family member" below |
 | `household/plugins/household_identity/` | Hermes plugin (Phase 8b part 2) — resolves a DM sender's registered name via `family_members.json` and prefixes it onto the message text, so "add this for me" resolves like a named third party would. DM-only, deliberately doesn't touch group chats (Hermes's own mechanism already handles those) |
 
-**Inside the container, NOT in this repo** (lives in the `hermes_data` Docker
-volume, persists across container recreation but not across a volume wipe):
+**Inside the container, NOT in this repo** (bind-mounted from
+`../conductor-data/hermes` — a sibling directory to this repo, not a
+Docker-managed named volume; see `docker-compose.yml`'s comment for why —
+persists across container recreation *and* is visible/backed-up-able on
+the host filesystem, unlike a named volume):
 
 | Path | What it is |
 |---|---|
-| `~/.hermes/config.yaml` | Runtime config — model, `terminal.backend`, `platform_toolsets` (which tools each channel can use), `mcp_servers` (our household server registration), `plugins.enabled` (Photon, household-identity) |
+| `~/.hermes/config.yaml` | Runtime config — model, `terminal.backend`, `platform_toolsets` (which tools each channel can use), `mcp_servers` (our household server registration), `plugins.enabled`. Kept in sync with `docker/hermes-config.yaml` in this repo — edit that file and redeploy, not the live one directly, or the two drift (this drifted badly once already; see project_plan.md's durability-pass note) |
 | `~/.hermes/.env` | Secrets, synced from this repo's `.env` (see "Common tasks" below) |
-| `~/.hermes/google_token.json` | Google OAuth token (Calendar + Tasks scopes) |
+| `~/.hermes/google_token.json` | Google OAuth token (Calendar + Tasks + Gmail `gmail.modify` scopes — Phase 11 added Gmail) |
 | `~/.hermes/google_client_secret.json` | Google OAuth client credentials |
 | `~/.hermes/family_members.json` | Synced copy of the repo-root `family_members.json` (see "Add a family member" below) |
+| `~/.hermes/email_watch_rules.json` | Email notification rules (Phase 11) — unlike `family_members.json`, this one **is** model-writable; created via conversation (`add_email_watch_rule`), not hand-edited |
+| `~/.hermes/email_notifier_state.json` | `email_notifier.py`'s own bookkeeping (last poll position, last digest date) — generated on first run, not committed |
 | `~/.hermes/scripts/household_reminders.py` | The cron entrypoint wrapper (copy of `household/cron_entrypoint.py`) |
+| `~/.hermes/scripts/household_email_notifier.py` | Same, for `household/email_notifier.py` (Phase 11) |
 | `~/.hermes/logs/gateway.log` | Platform connect/disconnect, message-level activity — **the first place to look when something doesn't work** |
 | `~/.hermes/logs/agent.log` | Per-turn reasoning/tool-call trace — noisier, useful for "why did it do that" |
 | `~/.hermes/logs/errors.log` | Just the warnings/errors across everything |
@@ -99,6 +107,17 @@ docker exec hermes-sandbox hermes gateway stop
 job definition. It does not hot-reload. `hermes cron` jobs are ticked by
 this same process — no separate scheduler to manage.
 
+**Shutdown can take longer than it looks.** Full teardown (disconnecting
+Telegram/Photon/API Server) can take up to ~20s if a platform's own
+notification send is slow — observed concretely with Photon's shutdown
+ping round-tripping through its cloud relay. Sending the next start
+command before teardown actually finishes leaves a stale `gateway.lock`
+pointing at a pid that's already dead, and the new process fails silently.
+Confirm the old process actually exited (`grep "Gateway stopped (total" ~/.hermes/logs/gateway.log`,
+or poll `/proc/<pid>`) before starting a new one; if a stale lock does show
+up, `rm -f ~/.hermes/gateway.lock ~/.hermes/gateway.pid` once the old pid
+is confirmed dead, then start normally.
+
 ### 4. ngrok (bare-metal on the host, not Docker)
 Tunnels the container's API Server port so ElevenLabs (voice) can reach it.
 ```bash
@@ -132,16 +151,16 @@ curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
 
 ### Google, specifically
 
-- **Cloud project ID:** `227341610220` (no dedicated name recorded — same project, both APIs)
-- **APIs enabled:** Calendar API, Tasks API — both had to be enabled individually; granting an OAuth scope does **not** imply the API itself is enabled (hit this exact 403 with Tasks)
+- **Cloud project ID:** `227341610220` (no dedicated name recorded — same project, all three APIs)
+- **APIs enabled:** Calendar API, Tasks API, Gmail API — each had to be enabled individually; granting an OAuth scope does **not** imply the API itself is enabled (hit this exact 403 with Tasks, checked proactively for Gmail before it bit us the same way — see project_plan.md Phase 11)
 - **OAuth client type:** Desktop app (matters — Google's own official Calendar MCP server requires a *Web application* client instead, a real blocker if that's ever adopted, see project_plan.md Phase 9 research item)
-- **Scopes granted, single consent covering both:** `https://www.googleapis.com/auth/calendar`, `https://www.googleapis.com/auth/tasks` — deliberately trimmed down from the bundled google-workspace skill's much broader default (which also requests Gmail send/modify, Drive, Contacts, Sheets, Docs)
-- **Whose Google account:** the household's own personal Gmail account — data lives in that account's real Calendar (`primary`) and two auto-created Tasks lists ("Groceries", "Chores")
-- **If the token ever needs regenerating:** `google-workspace` skill's `scripts/setup.py --revoke` then `--auth-url` / `--auth-code`, run via `/home/hermes/.hermes/hermes-agent/venv/bin/python3.11` (not the bare `python3.11` — that's a different, dependency-less interpreter). Full walkthrough in project_plan.md Phase 6.
+- **Scopes granted, single consent covering all three:** `https://www.googleapis.com/auth/calendar`, `https://www.googleapis.com/auth/tasks`, `https://www.googleapis.com/auth/gmail.modify` — deliberately trimmed down from the bundled google-workspace skill's much broader default (which also requests Gmail *send/modify* at a wider grant, plus Drive, Contacts, Sheets, Docs — `gmail.modify` alone covers read + send + labels, no permanent delete)
+- **Whose Google account:** `roseyfamilyconductor@gmail.com` — a **dedicated** account created specifically for this project, not anyone's personal inbox. Data lives in that account's real Calendar (`primary`), two auto-created Tasks lists ("Groceries", "Chores", plus any ad-hoc list created via `create_task_list`/`add_list_item`), and that account's real Gmail inbox (Phase 11)
+- **If the token ever needs regenerating:** `google-workspace` skill's `scripts/setup.py --revoke` then `--auth-url` / `--auth-code`, run via `/home/hermes/.hermes/hermes-agent/venv/bin/python3.11` (not the bare `python3.11` — that's a different, dependency-less interpreter). The skill's own `setup.py`/`google_api.py` `SCOPES` lists must match `household_mcp_server.py`'s exactly, or token/credential loading mismatches — both are patched together, see project_plan.md Phase 6/11. Full walkthrough in project_plan.md Phase 6.
 
 ### OpenAI, specifically
 
-- **Model used:** `gpt-5.4` — the household has a free daily token allowance on OpenAI, which is why this (not Anthropic) is the cloud-escalation provider.
+- **Model used:** `gpt-5.4` — the household has a free daily token allowance on OpenAI, which is why this (not Anthropic) is the cloud-escalation provider. `email_notifier.py` (Phase 11) uses `gpt-5.4-mini` instead (`CLOUD_MODEL_MINI`) for its two calls — topic-rule classification and the daily digest — since those can fire every 5-minute poll tick rather than on an occasional explicit request, and are comparatively easy tasks; `research_topic`/`plan_upcoming_week`/`summarize_past_week` are unaffected.
 - **Key lives in `.env` as `OPENAI_CLOUD_API_KEY` — deliberately NOT `OPENAI_API_KEY`.** `docker-compose.yml` already sets `OPENAI_API_KEY=local-omlx-no-key-required` at the container level (a placeholder Hermes's own local-model client needs). Anything reading the plain `OPENAI_API_KEY` env var inside the container gets that placeholder, not a real key — this cost real debugging time in Phase 8. `household_mcp_server.py`'s cloud tools read `OPENAI_CLOUD_API_KEY` explicitly (env first, falling back to reading `~/.hermes/.env` directly if the subprocess didn't inherit it).
 - **Called directly via the official SDK's Responses API** (`client.responses.create`, `reasoning: {effort: ...}`) from the household MCP server — not via Hermes's own `model.provider`, which normally stays local/oMLX. See "Run another A/B test" below for the one case where Hermes's primary model *is* temporarily pointed at OpenAI.
 - **Effort levels matter for latency:** `research_topic` uses `effort: "medium"` — `"high"` combined with the `web_search` tool can take 5+ minutes (multiple search rounds each add a reasoning pass) and blows past Hermes's MCP tool-call timeout. `plan_upcoming_week`/`summarize_past_week` use `"high"` — no web search, no compounding, tested fast.
@@ -150,11 +169,25 @@ curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
 
 ## Common tasks
 
-**Push a household/ code change into the running container** (no rebuild needed for household/ files):
+**Push a household/ code change into the running container.** `docker cp`
+alone is fast for iterating but only patches the *current* container's
+writable layer — `household/` is `COPY`'d into the image at build time, not
+part of the bind-mounted `~/.hermes`, so a later `docker compose up -d`
+(container recreation, not just a restart) silently reverts to whatever's
+actually baked into the image. Hit this for real during Phase 11: after a
+`docker compose down`/`up -d` for an unrelated change, `household_mcp_server.py`
+had reverted to an old snapshot mid-session. For a quick same-session test,
+the `docker cp` below is fine; **before the container is ever recreated
+again, `docker compose build` first** so the image itself is current:
 ```bash
+# Fast iteration within the current container's lifetime:
 docker cp household/household_mcp_server.py hermes-sandbox:/home/hermes/household/household_mcp_server.py
+docker exec -u root hermes-sandbox chown hermes:hermes /home/hermes/household/household_mcp_server.py
 docker exec hermes-sandbox hermes gateway stop
 docker exec -d hermes-sandbox hermes gateway run
+
+# Before the container is next recreated, make it durable:
+docker compose build
 ```
 
 **Push a plugin code change** (`household/plugins/household_identity/`, or any future plugin — different deploy path than `household_mcp_server.py`, since Hermes only discovers plugins from specific fixed locations):
