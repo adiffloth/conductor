@@ -64,6 +64,17 @@ DIGEST_WINDOW_START_HOUR = 7
 DIGEST_WINDOW_END_HOUR = 8
 DEFAULT_NOTIFY_CHANNEL = "telegram"
 
+# A message that fails classification or delivery gets retried this many
+# ticks (~5 min apart) before we give up and stop checking it — bounds
+# retry pileup rather than retrying a genuinely dead message forever. See
+# _check_watch_rules: without this, a transient failure was silently and
+# permanently dropping the notification (a real email about an item for
+# sale never notified — traced to a one-off topic-classification miss,
+# with no way to tell after the fact whether it was that or a delivery
+# failure, since neither path retried or was distinguishable in the
+# original code).
+MAX_RETRY_ATTEMPTS = 3
+
 
 def _load_state() -> dict:
     if not STATE_PATH.exists():
@@ -94,16 +105,20 @@ def _message_summary(service, message_id: str) -> dict:
     }
 
 
-def _classify_topic_matches(messages: list[dict], topic_rules: list[dict]) -> dict:
+def _classify_topic_matches(messages: list[dict], topic_rules: list[dict]) -> tuple[dict, bool]:
     """Ask the cloud model which of this tick's new messages match which
-    topic-based watch rules. Returns {message_id: [rule_id, ...]}.
+    topic-based watch rules. Returns ({message_id: [rule_id, ...]}, ok).
 
-    Fails open to "no matches" on any API/parsing problem — a missed
-    notification is far less disruptive than crashing the tick and silently
-    skipping the digest check that runs after it.
+    ``ok`` is False on any API/parsing problem — deliberately NOT treated
+    as "no matches" here. That distinction used to be collapsed (a failure
+    silently produced the same empty dict as a genuine no-match verdict),
+    which meant a transient hiccup permanently dropped a message with no
+    retry, indistinguishable after the fact from the classifier correctly
+    saying "no". The caller now retries on ``ok=False`` instead of treating
+    silence as a real answer.
     """
     if not messages or not topic_rules:
-        return {}
+        return {}, True
     topics_desc = "\n".join(f"- id={r['id']}: {r['topic']}" for r in topic_rules)
     emails_desc = "\n".join(
         f"- id={m['id']}: from {m['from']}, subject: {m['subject']}, preview: {m['snippet']}"
@@ -121,10 +136,10 @@ def _classify_topic_matches(messages: list[dict], topic_rules: list[dict]) -> di
     )
     try:
         raw = _call_cloud(prompt, model=CLOUD_MODEL_MINI, effort="low")
-        return json.loads(raw)
+        return json.loads(raw), True
     except Exception as exc:
-        _log(f"topic classification failed, treating as no matches: {exc}")
-        return {}
+        _log(f"topic classification failed (will retry): {exc}")
+        return {}, False
 
 
 def _check_watch_rules(service, state: dict) -> None:
@@ -148,38 +163,70 @@ def _check_watch_rules(service, state: dict) -> None:
     state["last_poll_epoch"] = now.timestamp()
 
     recent_notified = set(state.get("recent_notified_ids", []))
+    retry_attempts: dict = dict(state.get("pending_retry", {}))
+
+    # This tick's evaluation set: genuinely new mail from the time window,
+    # plus anything still owed a retry from a previous tick's classification
+    # or delivery failure. The time-window query alone won't re-surface a
+    # retry candidate once more than POLL_OVERLAP_SECONDS has passed, so
+    # without explicitly re-including it here a transient failure would
+    # silently and permanently drop the message — which is exactly what
+    # happened to a real "item for sale" email before this fix.
     new_ids = [mid for mid in candidate_ids if mid not in recent_notified]
-    if not new_ids:
+    to_check = list(dict.fromkeys(new_ids + list(retry_attempts.keys())))
+    if not to_check:
         _log("no new mail since last poll")
         return
 
-    messages = [_message_summary(service, mid) for mid in new_ids]
+    messages = [_message_summary(service, mid) for mid in to_check]
     rules = _load_email_watch_rules()
     sender_rules = [r for r in rules if r.get("kind") == "sender"]
     topic_rules = [r for r in rules if r.get("kind") == "topic"]
 
-    topic_matches = _classify_topic_matches(messages, topic_rules)
+    topic_matches, classification_ok = _classify_topic_matches(messages, topic_rules)
 
+    next_retry: dict = {}
     for msg in messages:
         matched_descriptions = []
         sender_addr = parseaddr(msg["from"])[1].lower()
         for rule in sender_rules:
             if rule.get("sender_email", "").lower() == sender_addr:
                 matched_descriptions.append(f"from {rule['sender_email']}")
-        for rule_id in topic_matches.get(msg["id"], []):
-            rule = next((r for r in topic_rules if r["id"] == rule_id), None)
-            if rule:
-                matched_descriptions.append(f"about '{rule['topic']}'")
 
+        # Sender matches are deterministic and don't depend on the cloud
+        # call, so they're evaluated (and delivered) regardless of whether
+        # topic classification succeeded this tick.
+        topic_pending = False
+        if classification_ok:
+            for rule_id in topic_matches.get(msg["id"], []):
+                rule = next((r for r in topic_rules if r["id"] == rule_id), None)
+                if rule:
+                    matched_descriptions.append(f"about '{rule['topic']}'")
+        elif topic_rules:
+            topic_pending = True
+
+        delivery_failed = False
         if matched_descriptions:
             text = (
                 f"📧 New email matching your watch rule ({', '.join(matched_descriptions)}):\n"
                 f"From: {msg['from']}\nSubject: {msg['subject']}\n\n{msg['snippet']}"
             )
-            _log(f"notifying: {text[:80]}...")
-            _deliver(text, DEFAULT_NOTIFY_CHANNEL)
+            if _deliver(text, DEFAULT_NOTIFY_CHANNEL):
+                _log(f"notified: {text[:80]}...")
+            else:
+                delivery_failed = True
+                _log(f"delivery failed for {msg['id']} (will retry)")
 
-    recent_notified.update(new_ids)
+        if topic_pending or delivery_failed:
+            attempts = retry_attempts.get(msg["id"], 0) + 1
+            if attempts <= MAX_RETRY_ATTEMPTS:
+                next_retry[msg["id"]] = attempts
+                continue
+            _log(f"giving up on {msg['id']} after {attempts} failed attempt(s)")
+
+        recent_notified.add(msg["id"])
+
+    state["pending_retry"] = next_retry
     state["recent_notified_ids"] = list(recent_notified)[-MAX_RECENT_IDS:]
 
 

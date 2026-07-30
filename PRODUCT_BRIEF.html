@@ -254,6 +254,8 @@
     padding: clamp(1rem, 3vw, 1.75rem);
     overflow-x: auto;
     margin-bottom: 1.4rem;
+    margin-left: clamp(-9rem, -10vw, 0px);
+    margin-right: clamp(-9rem, -10vw, 0px);
   }
 
   .diagram-frame pre.mermaid {
@@ -474,17 +476,45 @@
       <h2 class="section-label">How it works</h2>
       <span class="section-rule"></span>
     </div>
-    <p class="sub-lede">One assistant, two tiers of thinking.</p>
+    <p class="sub-lede">Reachable four ways. Most of the thinking happens at home.</p>
     <div class="diagram-frame">
 <pre class="mermaid">
-flowchart LR
-    FAMILY["Family members"] -->|"Telegram, iMessage, or a phone call"| CONDUCTOR["Conductor\nruns at home, sandboxed"]
-    CONDUCTOR --> LOCAL["Local model\nhandles routine requests"]
-    CONDUCTOR -.->|"a fixed task, or an explicit ask to research"| CLOUD["Cloud model\nharder reasoning, live search"]
-    CONDUCTOR <--> GOOGLE["Household calendar, lists &amp; email\nsame data, every channel"]
+flowchart TB
+    FAMILY(("Family members"))
+
+    subgraph CHANNELS[" "]
+        direction TB
+        TELEGRAM["Telegram"]
+        IMESSAGE["iMessage"]
+        PHONE["Phone call"]
+        EMAIL["Email"]
+    end
+
+    FAMILY --> TELEGRAM
+
+    subgraph HOME["At home — local &amp; sandboxed"]
+        direction LR
+        CONDUCTOR(["Conductor"])
+        LOCALMODEL["Local AI model\nhandles routine requests"]
+        CONDUCTOR --> LOCALMODEL
+    end
+
+    IMESSAGE --> CONDUCTOR
+    PHONE --> VOICE --> CONDUCTOR
+    EMAIL <--> CONDUCTOR
+
+    subgraph CLOUDSVC["In the cloud — used on purpose"]
+        direction TB
+        VOICE["Phone &amp; voice service\nspeech in, speech out"]
+        CLOUDMODEL["Cloud AI model\nharder reasoning, live search"]
+        GOOGLE["Household calendar,\nlists &amp; email"]
+    end
+
+    CONDUCTOR -.->|"a fixed task, or an\nexplicit ask to research"| CLOUDMODEL
+    CONDUCTOR <--> GOOGLE
 </pre>
     </div>
-    <p class="arch-note">The local model is the default for everything — it never leaves the house and there's no per-question cost. A short, deliberately chosen set of tasks always escalate to a more capable cloud model instead of guessing at "how hard" a question is; the household's own calendar, lists, and email live in Google, so the same state shows up whether it was set by voice, text, or directly in the Calendar/Tasks/Gmail apps.</p>
+    <p class="arch-note">Every channel reaches the same assistant, running at home on hardware the household owns — sandboxed, so nothing it does can see the rest of the computer. The local model is the default for everything and never leaves the house. Email works a bit differently from the other three: there's no live back-and-forth conversation over email itself — but anything sent to the household's address, attachments included, is there for Conductor to read, search, and reference the moment it's asked about on any channel. Email a document, then ask about it over Telegram. Three things happen in the cloud beyond delivering these channels: phone calls need a service to turn speech into text and back; a short, deliberately chosen set of tasks hand off to a more capable cloud model instead of guessing at "how hard" a question is; and the household's own calendar, lists, and email live in Google, so the same data shows up whether it was set by voice, text, or directly in the Calendar/Tasks/Gmail apps.</p>
   </section>
 
   <section id="principles">
@@ -526,3 +556,11 @@ flowchart LR
   </footer>
 
 </div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+  });
+</script>

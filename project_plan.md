@@ -79,9 +79,9 @@ flowchart TB
 
 > This diagram is the **original, pre-implementation** sketch from this planning phase — kept as-is for historical record rather than maintained as a living systems diagram (same reasoning as the strikethrough-and-note treatment used for superseded decisions below, e.g. Decision 1/2). It has since diverged in real ways: the `ANTHROPIC` node is OpenAI in practice (Decision 1, Phase 8), and it predates the household MCP server's actual tool set, the multi-user/family-registry mechanism, the local-vs-cloud A/B harness, and the `household-identity` plugin (all Phase 6–8b). See the current-architecture diagram below for what's actually running.
 
-### Current architecture (as of Phase 8b, 2026-07-26)
+### Current architecture (as of Phase 11, 2026-07-28)
 
-What the plan above became in practice — same overall shape (one sandbox container, oMLX bare-metal on the host, Google as the household data backend), but SMS never went live, Photon replaced it as the real interim/parallel text channel, the cloud-escalation provider is OpenAI rather than Anthropic and is invoked directly from custom tools rather than through Hermes's own provider config, and two capabilities the original plan didn't anticipate at all got added: multi-user scheduling against family members' own Google calendars, and a plugin that resolves DM sender identity.
+What the plan above became in practice — same overall shape (one sandbox container, oMLX bare-metal on the host, Google as the household data backend), but SMS never went live, Photon replaced it as the real interim/parallel text channel, the cloud-escalation provider is OpenAI rather than Anthropic and is invoked directly from custom tools rather than through Hermes's own provider config, and several capabilities the original plan didn't anticipate at all got added since: multi-user scheduling against family members' own Google calendars, a plugin that resolves DM sender identity, a second plugin that keeps relative-date reasoning correct across long-lived sessions, email (read/send/reply, watch rules, daily digest) as a second `hermes cron` job alongside the reminder scheduler, and a durability pass that moved Hermes's own state off a Docker-managed named volume.
 
 ```mermaid
 flowchart TB
@@ -91,11 +91,13 @@ flowchart TB
 
         subgraph DOCKER["Docker Desktop — container 'hermes-sandbox'"]
             HERMES["Hermes Agent gateway process\nTelegram + Photon + API Server (:8642)\nSMS configured, not connected (pending A2P)\nterminal backend: local, jailed to container"]
-            PLUGIN["household-identity plugin\n(pre_gateway_dispatch hook, in-process)\nDM sender -> registered family-member name"]
-            MCP["household_mcp_server.py\n(MCP subprocess, 14 tools)\ncalendar + tasks + multi-user + cloud escalation"]
+            PLUGINID["household-identity plugin\n(pre_gateway_dispatch hook, in-process)\nDM sender -> registered family-member name"]
+            PLUGINTIME["household-live-time plugin\n(pre_llm_call hook, in-process)\nrefreshes the live-clock anchor every turn"]
+            MCP["household_mcp_server.py\n(MCP subprocess, 26 tools)\ncalendar + tasks + email + multi-user + cloud escalation"]
             PHOTONSC["Photon Node sidecar\n(spectrum-ts gRPC, loopback :8789)"]
             SCHED["reminder scheduler\n(hermes cron, every 5 min)"]
-            VOL[("hermes_data volume\nconfig.yaml, .env, google_token.json,\nfamily_members.json")]
+            MAILSCHED["email notifier\n(hermes cron, every 5 min)\nwatch rules (sender/topic) + daily digest"]
+            VOL[("../conductor-data/hermes\nbind mount, sibling to repo\nconfig.yaml, .env, google_token.json,\nfamily_members.json, email_watch_rules.json")]
         end
     end
 
@@ -104,8 +106,8 @@ flowchart TB
         PHOTONCLOUD["Photon / Spectrum cloud\n(per-person assigned iMessage lines)"]
         TWILIO["Twilio\n(Voice -> ElevenLabs; SMS pending A2P)"]
         ELEVEN["ElevenLabs Conversational AI"]
-        OPENAI["OpenAI API (gpt-5.4)\nresearch_topic, plan_upcoming_week,\nsummarize_past_week + A/B-test cloud arm"]
-        GOOGLE["Google Calendar + Tasks\n(household account — hub calendar,\nGroceries/Chores lists)"]
+        OPENAI["OpenAI API\ngpt-5.4: research_topic, plan_upcoming_week,\nsummarize_past_week + A/B-test cloud arm\ngpt-5.4-mini: email watch-rule classification + digest"]
+        GOOGLE["Google Calendar + Tasks + Gmail\n(household account — hub calendar,\nany named task list, gmail.modify)"]
         FAMCAL[("Each family member's own\nGoogle Calendar — shared\nfree/busy-only with the household")]
     end
 
@@ -121,21 +123,28 @@ flowchart TB
     TWILIO <--> ELEVEN
     ELEVEN -->|custom LLM webhook| NGROK --> HERMES
 
-    HERMES --> PLUGIN
-    PLUGIN -. resolves DM sender, tags message .-> HERMES
+    HERMES --> PLUGINID
+    PLUGINID -. resolves DM sender, tags message .-> HERMES
+    HERMES --> PLUGINTIME
+    PLUGINTIME -. injects current time .-> HERMES
     HERMES --> OMLX
     HERMES <-->|stdio MCP| MCP
-    MCP <-->|events, tasklists, freebusy| GOOGLE
+    MCP <-->|events, tasklists, mail, freebusy| GOOGLE
     MCP -. freebusy check + attendee invite .-> FAMCAL
     MCP -. explicit trigger: research/plan/summarize .-> OPENAI
 
     HERMES <--> VOL
     MCP -.-> VOL
-    PLUGIN -.-> VOL
+    PLUGINID -.-> VOL
     SCHED <--> VOL
     SCHED -->|poll due reminders| GOOGLE
     SCHED -.-> TG
     SCHED -.-> PHOTONCLOUD
+    MAILSCHED <--> VOL
+    MAILSCHED -->|poll new mail, classify| GOOGLE
+    MAILSCHED -. topic classification + digest .-> OPENAI
+    MAILSCHED -.-> TG
+    MAILSCHED -.-> PHOTONCLOUD
 ```
 
 ### Component responsibilities
@@ -148,9 +157,12 @@ flowchart TB
 | **Hermes Agent — Photon gateway (iMessage)** | Sandbox container | Native process; persistent gRPC connection to Photon's Spectrum cloud via the Node sidecar — no webhook, no public URL, no ngrok. Free tier: each family member is registered individually (`hermes photon setup --phone <E.164>`) and gets their own assigned iMessage line from Photon's shared pool, not one shared household number. |
 | **Photon Node sidecar** | Sandbox container, loopback :8789 | Small supervised Node process running the `spectrum-ts` SDK (TypeScript-only) — bridges the Python gateway to Photon's gRPC stream. Started/restarted/killed by the Python adapter; never invoked directly. |
 | **Hermes Agent — API Server** | Sandbox container, :8642 | Exposes the same agent as an OpenAI-compatible endpoint — the integration seam for ElevenLabs voice. |
-| **household skill** (custom, agentskills.io-standard) | Loaded by Hermes | Tools: `list_task_lists`, `add_list_item`, `list_items`, `remove_list_item`, `complete_list_item`, `create_task_list`, `delete_task_list` (generic across any named list, not just groceries/chores — see Phase 6 update below), `get_agenda`, `add_calendar_event`, `set_reminder`, etc. Grocery list, chores, and any ad-hoc list (e.g. "Vacation packing") map to **Google Tasks** lists; agenda/events/reminders map to **Google Calendar** — both via OAuth, so identical state regardless of which channel was used, and family members can also see/edit it directly in Google's own apps. |
-| **Google Tasks + Calendar API** | Cloud | The actual list/calendar backend behind the household skill. Official OAuth APIs, works with personal Gmail accounts (unlike the Google Keep API, which is Workspace-only). |
-| **reminder scheduler** (custom, this repo) | Sandbox container, companion process | The one piece of proactive-push logic nothing else provides: Google Calendar can notify the account owner, but it can't push into Telegram/SMS. The scheduler polls Calendar for upcoming Hermes-tagged events and pushes them out via Telegram Bot API or Twilio REST API, then marks them sent. |
+| **household MCP server** (`household/household_mcp_server.py`, custom, this repo) | Sandbox container, stdio MCP subprocess | 26 tools, superseding the originally-planned agentskills.io skill (see Phase 6's architecture-change note): `get_agenda`/`add_calendar_event`/`set_reminder`/`update_calendar_event`/`delete_calendar_event`/`search_calendar_events`/`suggest_meeting_time`/`list_family_members` (calendar + multi-user), `list_task_lists`/`add_list_item`/`set_due_date`/`remove_list_item`/`complete_list_item`/`list_items`/`create_task_list`/`delete_task_list` (generic across any named list, not just groceries/chores), `search_emails`/`read_email`/`send_email`/`reply_to_email`/`add_email_watch_rule`/`list_email_watch_rules`/`remove_email_watch_rule` (Gmail, Phase 11), and `research_topic`/`plan_upcoming_week`/`summarize_past_week` (cloud escalation). |
+| **household-identity plugin** (`household/plugins/household_identity/`, custom, this repo) | Sandbox container, in-process Hermes plugin | `pre_gateway_dispatch` hook: resolves an authenticated DM sender's Telegram ID / Photon phone number against `family_members.json` and rewrites the message with a `[Name]` prefix, so "add this for me" resolves the same way a named third party does. DM-only; group chats already get Hermes's own sender-tagging. |
+| **household-live-time plugin** (`household/plugins/household_live_time/`, custom, this repo) | Sandbox container, in-process Hermes plugin | `pre_llm_call` hook: re-injects the current date/time on every turn, working around Hermes caching the session's system prompt (with its one-time date anchor) for the life of a long-lived Telegram/Photon session — without this, relative dates ("today", "in 5 days") silently drift once a session spans midnight (Phase 6 update, root-caused from a 2026-07-27 incident). |
+| **Google Tasks + Calendar + Gmail API** | Cloud | The actual list/calendar/mail backend behind the household MCP server, all on one dedicated household Google account (`roseyfamilyconductor@gmail.com`). Official OAuth APIs (`calendar`, `tasks`, `gmail.modify` scopes), works with a personal Gmail account (unlike the Google Keep API, which is Workspace-only). |
+| **reminder scheduler** (`household/reminder_scheduler.py`, custom, this repo) | Sandbox container, `hermes cron` job, every 5 min | The one piece of proactive-push logic nothing else provides: Google Calendar can notify the account owner, but it can't push into Telegram/iMessage. Polls Calendar for due Hermes-tagged reminders (looking a full poll interval ahead and sleeping to the exact second for on-time delivery) and pushes each one via `hermes send` to whichever channel (`telegram` or `photon`) the reminder was set with, then marks it sent. |
+| **email notifier** (`household/email_notifier.py`, custom, this repo) | Sandbox container, `hermes cron` job, every 5 min | Mirrors the reminder scheduler's shape (Phase 11): matches new mail against user-defined watch rules (`add_email_watch_rule` — plain address comparison for sender rules, a batched cloud classification call via `gpt-5.4-mini` for topic rules) and separately pushes a once-daily digest, both via the same `hermes send`-based delivery the reminder scheduler uses. Deliberately not built on Hermes's own bundled email-platform plugin, which always auto-replies via email with no "just notify a different channel" mode. |
 | **ElevenLabs Conversational AI** | Cloud | Owns the real-time voice layer end-to-end: STT, ultra-realistic TTS, turn-taking, barge-in. Its "custom LLM" endpoint points at Hermes's API Server (via ngrok) — Hermes does all the reasoning/tool-calling, ElevenLabs never touches household data directly. |
 | **ngrok** | Host (or a thin sidecar) | Public HTTPS tunnel(s) terminating at the container's SMS-webhook port (:8080) and API Server port (:8642), since Twilio and ElevenLabs both need a public URL to reach the sandboxed container. **Not used by Photon** — its gRPC connection is outbound-only from the sidecar, no inbound public endpoint required. |
 | **Docker** | Host | The single sandbox boundary. No bind mount of `~/Documents`, iCloud Drive, Time Machine, or any host user directory — only the dedicated `/data` mount, itself now a bind mount to a sibling directory (`../conductor-data/hermes`, not a Docker-managed named volume — see the durability pass below) rather than the user's own folders. No Docker socket mounted in. |
@@ -203,10 +215,10 @@ flowchart TB
 - **Host OS/hardware:** macOS on Mac Studio M4 Max, 64GB unified memory
 - **Local inference:** oMLX (omlx.ai) — bare-metal menubar app, OpenAI-compatible API on `:8000` (default, confirm on your install), running **Qwen3.6-35B-A3B-MLX-6bit** (the currently active model as of Phase 2's end — see Decision 2 update; `Hermes-4.3-36B-mlx-5Bit` also downloaded, queued as a *local-model-vs-local-model* A/B comparison, not yet run — distinct from the local-vs-cloud A/B harness built in Phase 8)
 - **Agent core:** Hermes Agent (`NousResearch/hermes-agent`), Python/uv-based, MIT licensed — Telegram, Photon (iMessage), and API Server gateway processes live; SMS gateway process supported but not yet live (pending A2P 10DLC, Phase 4b)
-- **Cloud LLM (complex-reasoning escalation):** OpenAI (`gpt-5.4`, via the household's free daily token allowance) — called directly from custom tools, not Hermes's own provider config (see Phase 8)
-- **Containerization:** Docker Desktop for Mac, docker-compose for the sandbox container and the shared `/data` volume
-- **Custom code (this repo):** Python 3.12 — the household MCP server (`household/household_mcp_server.py`, 14 tools: calendar, tasks, multi-user scheduling, cloud escalation), the reminder scheduler process, a Hermes plugin for DM sender-identity resolution (`household/plugins/household_identity/`, Phase 8b), and a local-vs-cloud model A/B benchmarking harness (`household/ab_test/`, Phase 8)
-- **Household data store:** Google Tasks API (grocery list, chores) + Google Calendar API (agenda, events, reminders), via OAuth; a small SQLite file on the Docker-managed `/data` volume for the reminder scheduler's own bookkeeping and Hermes's memory/skills state
+- **Cloud LLM (complex-reasoning escalation):** OpenAI — `gpt-5.4` for `research_topic`/`plan_upcoming_week`/`summarize_past_week` (via the household's free daily token allowance), `gpt-5.4-mini` for the email notifier's watch-rule classification and daily digest (Phase 11) — called directly from custom tools, not Hermes's own provider config (see Phase 8)
+- **Containerization:** Docker Desktop for Mac, docker-compose for the sandbox container and the `~/.hermes` bind mount (`../conductor-data/hermes`, sibling to this repo — see the Phase 6/durability-pass note below)
+- **Custom code (this repo):** Python 3.12 — the household MCP server (`household/household_mcp_server.py`, 26 tools: calendar, tasks, email, multi-user scheduling, cloud escalation), the reminder scheduler process, the email notifier process (`household/email_notifier.py`, Phase 11), two Hermes plugins — DM sender-identity resolution (`household/plugins/household_identity/`, Phase 8b) and live-clock injection (`household/plugins/household_live_time/`, Phase 6 update) — and a local-vs-cloud model A/B benchmarking harness (`household/ab_test/`, Phase 8)
+- **Household data store:** Google Tasks API (grocery list, chores, and any ad-hoc list) + Google Calendar API (agenda, events, reminders) + Gmail API (search/send/reply, `gmail.modify` scope, Phase 11), via OAuth against one dedicated household Google account; a small SQLite file on the bind-mounted `~/.hermes` directory for the reminder/email schedulers' own bookkeeping and Hermes's memory/skills state
 - **Channels:**
   - Telegram Bot API (via BotFather token) — native Hermes gateway
   - Twilio Programmable SMS — native Hermes gateway — **pending A2P 10DLC registration** (Decision 6)
@@ -367,6 +379,10 @@ Each phase is a working, demoable milestone — nothing is built until the layer
   - Deliberately **did not** add voice as a third channel option — delivering by voice means placing an outbound phone call (Twilio outbound-calling API + ElevenLabs speaking the message), not a `hermes send`-style push to an existing conversation. A materially different feature, not a parameter value. Logged as **Phase 10** instead of bundling it in here.
   - Verified: reminders set with `channel="photon"`, default (no channel → Telegram), and an invalid channel (`"discord"`) — the last rejected cleanly with no calendar event created, rather than silently falling back or erroring after the fact. Both valid channels delivered correctly on the same scheduler run, confirmed live in both Telegram and iMessage.
 - **Update (2026-07-27) — precise delivery timing, not just "within 5 minutes."** A reminder set for 2:45 was observed landing at 2:49 — not a delivery bug, but the direct consequence of only querying for reminders already due *at* the poll instant (`timeMax=now`), so actual delivery lagged the requested time by up to a full poll interval depending on where it fell relative to the tick. Fixed by widening the query to look a full `POLL_INTERVAL_MINUTES` ahead and, for anything found still in the future, `time.sleep()`-ing the exact remaining seconds before delivering. Verified live: a reminder set 45s out landed within ~1.4s of the target instant (was previously bounded only by "somewhere in the next 5 minutes"). Checked the one real risk this introduces — a run sleeping close to the full interval could overlap the next scheduled tick — against the cron scheduler's own behavior: it already skips a tick that fires while the previous one is still running rather than double-firing, and nothing is lost by a skipped tick since there's no lower bound on how overdue an unsent reminder can be; the next tick's own lookahead still covers it.
+- **Update (2026-07-28) — fixed a real Hermes-framework bug in how `hermes send` records proactive pushes into session history, found via a live user report.** A completely unrelated, ordinary conversation turn (removing an email watch rule) came back with two old, already-delivered reminder texts appended verbatim to the new response. Traced via `state.db`: the new response was one single stored message whose content literally concatenated the confirmation text with two stale `⏰ Reminder: ...` lines from hours earlier — not a redelivery, the model's own new completion had echoed old context. Root cause, in vendored Hermes code, not ours: `gateway/mirror.py`'s own docstring says a "cron brief delivered out-of-band" (exactly what `reminder_scheduler.py`/`email_notifier.py` are) must mirror into session history with `role="user"`, or an assistant-role mirror with no matching user turn is indistinguishable from a real reply and produces `assistant→assistant` pairs that `repair_message_sequence`'s Pass 0 merges together (their own tracked issue #2221) — but `tools/send_message_tool.py` (what `hermes send` actually calls) never passed it, always defaulting to `role="assistant"`. Every proactive push this project has ever sent was recorded this way; enough of them accumulating in this session's long-lived history is what let the local model latch onto and echo one.
+  - **Patched `tools/send_message_tool.py` directly** (container-local, vendored-code patch — **not tracked in this git repo, will not survive a `hermes-agent` update, must be reapplied**, same category as the google-workspace skill's `SCOPES` patches in Phase 6, but this one touches core gateway internals rather than a skill script, so it's a bigger risk to carry forward): when `HERMES_SESSION_PLATFORM` falls through to its `"cli"` default — meaning it was never bound via `set_session_vars` in this process, i.e. there's no live gateway turn running (confirmed by reading `gateway/session_context.py`: Telegram/Photon/API Server all bind it via a per-task `ContextVar`; a standalone `hermes send` subprocess never does) — the mirror now passes `role="user"` instead of the default `role="assistant"`.
+  - **Verified live, both directions:** a standalone `hermes send --to telegram:... "TEST"` (same invocation shape as the reminder/email schedulers) now lands in `state.db` as `role="user"` (was `role="assistant"` before the patch); a real conversation turn through the API Server still answered normally afterward, confirming the patch doesn't touch the main turn-response path at all — only the `send_message` tool's own mirror call.
+  - Not upstreamed. If this project ever tracks a `hermes-agent` version bump, re-check this patch is still present before assuming reminders/email notifications are behaving correctly.
 
 ### Phase 8 — Cloud escalation (OpenAI) — ✅ COMPLETE (2026-07-26)
 - **Reframed before building** (2026-07-26): the original framing ("escalation" to a bigger/smarter/faster model, triggered by perceived complexity) was replaced with a three-tier, deterministic model instead of a complexity-judging router — Hermes has no automatic complexity-based router (Decision 2), and having the local model self-assess "is this too hard for me" is unreliable and hard to test. The three tiers:

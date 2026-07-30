@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Seed realistic demo data for the household MCP server.
 
-Run manually before a demo to (re)populate calendar events, groceries, and
-chore-log entries relative to "today". Makes FEATURES_AND_VALIDATION.md's
-scenarios demonstrable against real, lived-in-looking data instead of an
-empty household.
+Run manually before a demo to (re)populate calendar events, groceries,
+chore-log entries, and inbox emails, relative to "today". Makes
+FEATURES_AND_VALIDATION.md's scenarios demonstrable against real,
+lived-in-looking data instead of an empty household.
 
 Not deduped — re-running adds a second copy of everything. Fine for
 refreshing dates before a demo (delete the old items first in the Google
@@ -26,6 +26,7 @@ from household_mcp_server import (  # noqa: E402
     REMINDER_TAG,
     _calendar_service,
     _find_or_create_tasklist,
+    _gmail_service,
     _tasks_service,
 )
 
@@ -151,6 +152,103 @@ def seed_chores() -> None:
         print(f"  + chore: {result.get('title')} ({days_ago}d ago)")
 
 
+def _raw_email(from_addr: str, from_name: str, subject: str, body: str, date: datetime) -> str:
+    """Base64url-encoded RFC 2822 message for Gmail's messages.insert.
+
+    Deliberately not household_mcp_server.send_email — that sends live via
+    SMTP from the household's own address in real time, neither of which
+    seed data wants: these need a synthetic "From" (so search/read demos
+    have more than one sender to look at) and a backdated Date header (so
+    the daily-digest demo has real "yesterday" mail to summarize), and
+    insert() stores a message directly in the mailbox without actually
+    delivering anything.
+    """
+    import base64
+    from email.message import EmailMessage
+    from email.utils import format_datetime
+
+    message = EmailMessage()
+    message["From"] = f"{from_name} <{from_addr}>"
+    message["To"] = "roseyfamilyconductor@gmail.com"
+    message["Subject"] = subject
+    message["Date"] = format_datetime(date)
+    message.set_content(body)
+    return base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+
+def seed_emails() -> None:
+    service = _gmail_service()
+    # (from_addr, from_name, subject, body, day_offset, hour, minute)
+    emails = [
+        (
+            "sam.rosey@example.com",
+            "Sam Rosey",
+            "Can you pick me up a bit early today?",
+            "Practice is ending at 5 instead of 5:30 — any chance someone can grab me then instead?",
+            0,
+            13,
+            12,
+        ),
+        (
+            "buyer.jt@example-marketplace.com",
+            "JT (Marketplace)",
+            "Interested in your patio table listing",
+            "Hi! Is the patio table still available? Would you be open to $60 and I can pick up this weekend?",
+            0,
+            10,
+            40,
+        ),
+        (
+            "office@roosevelt-elementary.example.edu",
+            "Roosevelt Elementary",
+            "Reminder: school closed Monday for teacher training",
+            "This is a reminder that Roosevelt Elementary will be closed this coming Monday for a "
+            "scheduled teacher training day. Regular classes resume Tuesday.",
+            -1,
+            9,
+            5,
+        ),
+        (
+            "grandma.rosey@example.com",
+            "Grandma",
+            "Looking forward to Sunday dinner!",
+            "Can't wait to see everyone this Sunday. Should I bring my green bean casserole, or is "
+            "someone else already on dessert duty?",
+            -1,
+            16,
+            20,
+        ),
+        (
+            "newsletter@fitclub-example.com",
+            "FitClub Weekly",
+            "This week's class schedule + a new instructor!",
+            "Check out this week's lineup of classes and meet our newest yoga instructor. Book your "
+            "spot before it fills up!",
+            -1,
+            8,
+            0,
+        ),
+        (
+            "billing@citypower-example.com",
+            "City Power & Utilities",
+            "Your latest bill is ready to view",
+            "Your most recent utility bill is now available online. Amount due: $142.87, due in 3 weeks.",
+            -2,
+            7,
+            30,
+        ),
+    ]
+    for from_addr, from_name, subject, body, day_offset, hour, minute in emails:
+        date = _at(day_offset, hour, minute)
+        raw = _raw_email(from_addr, from_name, subject, body, date)
+        service.users().messages().insert(
+            userId="me",
+            body={"raw": raw, "labelIds": ["INBOX", "UNREAD"]},
+            internalDateSource="dateHeader",
+        ).execute()
+        print(f"  + email: {subject!r} from {from_name} ({day_offset}d)")
+
+
 if __name__ == "__main__":
     print("Seeding calendar events...")
     seed_calendar()
@@ -158,4 +256,6 @@ if __name__ == "__main__":
     seed_groceries()
     print("Seeding chore log...")
     seed_chores()
+    print("Seeding emails...")
+    seed_emails()
     print("Done.")

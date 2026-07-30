@@ -69,8 +69,26 @@ def _load_photon_sidecar_token() -> str | None:
     return None
 
 
+# cron's own "no_agent" job output only ever records stdout — this
+# deliberately writes nothing there (see module docstring), and its own
+# stderr isn't captured anywhere durable either, so a `no_agent` cron run's
+# diagnostics vanish the moment the process exits. Found this the hard way
+# debugging a missed email notification (household/email_notifier.py, which
+# imports this _log) with no way to see what that run had actually decided.
+# Appending to a plain file alongside stderr means a later investigation
+# doesn't depend on reproducing the exact conditions by hand.
+_LOG_PATH = get_hermes_home() / "logs" / "household_scripts.log"
+
+
 def _log(msg: str) -> None:
-    print(msg, file=sys.stderr)
+    line = f"{datetime.now(timezone.utc).isoformat()} [{Path(__file__).stem}] {msg}"
+    print(line, file=sys.stderr)
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def _due_or_upcoming_reminders(service) -> list[dict]:
